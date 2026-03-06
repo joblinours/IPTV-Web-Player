@@ -33,6 +33,8 @@ export interface ContentItem {
   description?: string | null;
   genre?: string | null;
   year?: string | null;
+  duration?: string | null;
+  durationSeconds?: number | null;
   epgChannelId?: string | null;
   hasArchive?: boolean;
   archiveDurationHours?: number | null;

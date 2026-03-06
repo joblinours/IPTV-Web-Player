@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import Hls from 'hls.js';
 import { X } from 'lucide-react';
 
@@ -7,12 +7,45 @@ interface VideoPlayerModalProps {
     title: string;
     streamUrl: string | null;
     streamSources?: string[];
+    expectedDurationSeconds?: number | null;
     onClose: () => void;
 }
 
-export function VideoPlayerModal({ open, title, streamUrl, streamSources = [], onClose }: VideoPlayerModalProps) {
+function formatDuration(totalSeconds: number): string {
+    const normalized = Math.max(0, Math.floor(totalSeconds));
+    const hours = Math.floor(normalized / 3600);
+    const minutes = Math.floor((normalized % 3600) / 60);
+    const seconds = normalized % 60;
+
+    if (hours > 0) {
+        return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+    }
+
+    return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+export function VideoPlayerModal({ open, title, streamUrl, streamSources = [], expectedDurationSeconds = null, onClose }: VideoPlayerModalProps) {
     const videoRef = useRef<HTMLVideoElement>(null);
+    const [activeSourceIndex, setActiveSourceIndex] = useState(0);
+    const [currentTimeSeconds, setCurrentTimeSeconds] = useState(0);
     const allSources = streamSources.length > 0 ? streamSources : streamUrl ? [streamUrl] : [];
+    const isFallbackActive = activeSourceIndex > 0;
+
+    const progressLabel = useMemo(() => {
+        if (!isFallbackActive) return null;
+        if (typeof expectedDurationSeconds !== 'number' || !Number.isFinite(expectedDurationSeconds) || expectedDurationSeconds <= 0) {
+            return null;
+        }
+
+        return `${formatDuration(currentTimeSeconds)} / ${formatDuration(expectedDurationSeconds)}`;
+    }, [isFallbackActive, expectedDurationSeconds, currentTimeSeconds]);
+
+    useEffect(() => {
+        if (!open) {
+            setActiveSourceIndex(0);
+            setCurrentTimeSeconds(0);
+        }
+    }, [open]);
 
     useEffect(() => {
         if (!open || allSources.length === 0 || !videoRef.current) return;
@@ -34,6 +67,7 @@ export function VideoPlayerModal({ open, title, streamUrl, streamSources = [], o
             clearWatchdog();
             sourceIndex += 1;
             if (sourceIndex < allSources.length) {
+                setActiveSourceIndex(sourceIndex);
                 loadSource(allSources[sourceIndex]);
             }
         };
@@ -83,6 +117,9 @@ export function VideoPlayerModal({ open, title, streamUrl, streamSources = [], o
         };
 
         const loadSource = (url: string) => {
+            setActiveSourceIndex(sourceIndex);
+            setCurrentTimeSeconds(0);
+
             if (hls) {
                 hls.destroy();
                 hls = null;
@@ -114,12 +151,20 @@ export function VideoPlayerModal({ open, title, streamUrl, streamSources = [], o
             tryNextSource();
         };
 
+        const handleTimeUpdate = () => {
+            const value = Number(videoElement.currentTime);
+            if (!Number.isFinite(value) || value < 0) return;
+            setCurrentTimeSeconds(Math.floor(value));
+        };
+
         videoElement.addEventListener('error', handleError);
+        videoElement.addEventListener('timeupdate', handleTimeUpdate);
         loadSource(allSources[sourceIndex]);
 
         return () => {
             clearWatchdog();
             videoElement.removeEventListener('error', handleError);
+            videoElement.removeEventListener('timeupdate', handleTimeUpdate);
             videoElement.pause();
             videoElement.removeAttribute('src');
             videoElement.load();
@@ -140,11 +185,13 @@ export function VideoPlayerModal({ open, title, streamUrl, streamSources = [], o
                         <X size={18} />
                     </button>
                 </div>
-                <div className="aspect-video bg-black">
+                <div className="aspect-video bg-black relative">
                     <video ref={videoRef} controls className="w-full h-full" playsInline />
-                </div>
-                <div className="px-4 py-3 border-t border-white/10 text-xs text-gray-400">
-                    Certains flux (ex: MKV avec codecs non supportés navigateur) peuvent être muets/non lisibles. Le lecteur tente automatiquement plusieurs formats.
+                    {progressLabel && (
+                        <div className="absolute bottom-3 right-3 text-xs text-white bg-black/60 px-2 py-1 rounded">
+                            {progressLabel}
+                        </div>
+                    )}
                 </div>
             </div>
         </div>

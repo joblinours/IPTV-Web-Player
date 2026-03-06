@@ -33,6 +33,8 @@ type XtreamStream = {
   tv_archive?: number | string;
   tv_archive_duration?: number | string;
   epg_channel_id?: string;
+  duration?: string;
+  duration_secs?: number | string;
 };
 
 type XtreamSeriesEpisode = {
@@ -119,6 +121,31 @@ declare module 'fastify' {
 
 function nowEpoch(): number {
   return Math.floor(Date.now() / 1000);
+}
+
+function parseDurationToSeconds(rawDuration: string | null | undefined): number | null {
+  if (!rawDuration) return null;
+  const value = rawDuration.trim();
+  if (!value) return null;
+
+  const parts = value.split(':').map((part) => Number(part));
+  if (parts.some((part) => !Number.isFinite(part))) return null;
+
+  if (parts.length === 3) {
+    const [hours, minutes, seconds] = parts;
+    return Math.max(0, hours * 3600 + minutes * 60 + seconds);
+  }
+
+  if (parts.length === 2) {
+    const [minutes, seconds] = parts;
+    return Math.max(0, minutes * 60 + seconds);
+  }
+
+  if (parts.length === 1) {
+    return Math.max(0, parts[0]);
+  }
+
+  return null;
 }
 
 function hashPassword(password: string): string {
@@ -473,23 +500,33 @@ app.get('/api/iptv/content', { preHandler: [app.authenticate] }, async (request:
   const paged = filtered.slice(resolvedOffset, resolvedOffset + parsed.data.limit);
   const pagination = computePagination(filtered.length, resolvedOffset, parsed.data.limit);
 
-  const mapped = paged.map((entry) => ({
-    id: String(entry.stream_id ?? entry.series_id ?? ''),
-    title: entry.name ?? entry.title ?? 'Untitled',
-    categoryId: String(entry.category_id ?? ''),
-    poster: entry.stream_icon ?? entry.cover ?? null,
-    description: entry.plot ?? null,
-    genre: (entry as any).genre ?? null,
-    year: entry.year ?? (entry.release_date ? String(entry.release_date).slice(0, 4) : null),
-    epgChannelId: entry.epg_channel_id ?? null,
-    hasArchive:
-      String(entry.tv_archive ?? '0') === '1' || Number(entry.tv_archive_duration ?? 0) > 0,
-    archiveDurationHours: Number(entry.tv_archive_duration ?? 0) || null,
-    rating: entry.rating ?? null,
-    containerExtension: entry.container_extension ?? null,
-    streamId: entry.stream_id ?? null,
-    seriesId: entry.series_id ?? null,
-  }));
+  const mapped = paged.map((entry) => {
+    const duration = typeof entry.duration === 'string' ? entry.duration : null;
+    const rawDurationSeconds = Number(entry.duration_secs ?? NaN);
+    const durationSeconds = Number.isFinite(rawDurationSeconds) && rawDurationSeconds > 0
+      ? Math.floor(rawDurationSeconds)
+      : parseDurationToSeconds(duration);
+
+    return {
+      id: String(entry.stream_id ?? entry.series_id ?? ''),
+      title: entry.name ?? entry.title ?? 'Untitled',
+      categoryId: String(entry.category_id ?? ''),
+      poster: entry.stream_icon ?? entry.cover ?? null,
+      description: entry.plot ?? null,
+      genre: (entry as any).genre ?? null,
+      year: entry.year ?? (entry.release_date ? String(entry.release_date).slice(0, 4) : null),
+      epgChannelId: entry.epg_channel_id ?? null,
+      hasArchive:
+        String(entry.tv_archive ?? '0') === '1' || Number(entry.tv_archive_duration ?? 0) > 0,
+      archiveDurationHours: Number(entry.tv_archive_duration ?? 0) || null,
+      rating: entry.rating ?? null,
+      duration,
+      durationSeconds,
+      containerExtension: entry.container_extension ?? null,
+      streamId: entry.stream_id ?? null,
+      seriesId: entry.series_id ?? null,
+    };
+  });
 
   return {
     items: mapped,

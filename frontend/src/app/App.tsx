@@ -103,6 +103,7 @@ export default function App() {
     const [playerTitle, setPlayerTitle] = useState('');
     const [playerUrl, setPlayerUrl] = useState<string | null>(null);
     const [playerSources, setPlayerSources] = useState<string[]>([]);
+    const [playerExpectedDurationSeconds, setPlayerExpectedDurationSeconds] = useState<number | null>(null);
 
     const [seriesDetailOpen, setSeriesDetailOpen] = useState(false);
     const [seriesDetailData, setSeriesDetailData] = useState<SeriesInfoResponse | null>(null);
@@ -472,11 +473,16 @@ export default function App() {
         [token, accountId]
     );
 
-    const openPlayer = (title: string, sources: string[]) => {
+    const openPlayer = (title: string, sources: string[], expectedDurationSeconds?: number | null) => {
         if (sources.length === 0) return;
         setPlayerTitle(title);
         setPlayerUrl(sources[0]);
         setPlayerSources(sources);
+        setPlayerExpectedDurationSeconds(
+            typeof expectedDurationSeconds === 'number' && Number.isFinite(expectedDurationSeconds) && expectedDurationSeconds > 0
+                ? Math.floor(expectedDurationSeconds)
+                : null
+        );
         setPlayerOpen(true);
     };
 
@@ -521,7 +527,7 @@ export default function App() {
             const sources = await resolvePlaybackSources(item, activeSection, streamId, {
                 mediaTitle: item.title,
             });
-            openPlayer(item.title, sources);
+            openPlayer(item.title, sources, item.durationSeconds ?? null);
         },
         [token, accountId, activeSection, resolvePlaybackSources, handleOpenSeriesDetails]
     );
@@ -555,7 +561,7 @@ export default function App() {
             );
 
             setSeriesDetailOpen(false);
-            openPlayer(episode.title, sources);
+            openPlayer(episode.title, sources, episode.durationSeconds ?? null);
         },
         [token, accountId, resolvePlaybackSources, seriesDetailData]
     );
@@ -645,7 +651,7 @@ export default function App() {
                 );
 
                 const sources = replayUrls.filter((url): url is string => !!url);
-                openPlayer(epgItem.title || recordingsTitle, sources);
+                openPlayer(epgItem.title || recordingsTitle, sources, duration * 60);
             } catch {
                 // noop
             }
@@ -739,10 +745,12 @@ export default function App() {
                 title={playerTitle}
                 streamUrl={playerUrl}
                 streamSources={playerSources}
+                expectedDurationSeconds={playerExpectedDurationSeconds}
                 onClose={() => {
                     setPlayerOpen(false);
                     setPlayerUrl(null);
                     setPlayerSources([]);
+                    setPlayerExpectedDurationSeconds(null);
                 }}
             />
 
