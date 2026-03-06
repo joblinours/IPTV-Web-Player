@@ -15,6 +15,7 @@ Modern web IPTV player compatible with the Xtream Codes API.
 - [Run Locally (Machine)](#run-locally-machine)
 - [Run with Docker](#run-with-docker)
 - [Run with Docker Compose](#run-with-docker-compose)
+- [CI/CD Docker Hub (GitHub Actions)](#cicd-docker-hub-github-actions)
 - [Environment Variables](#environment-variables)
 - [Acknowledgements](#acknowledgements)
 - [Legal Warning](#legal-warning)
@@ -79,7 +80,7 @@ The backend handles authentication, IPTV account security, data retrieval, and m
 
 - [ ] Favorites (channels, movies, series, episodes).
 - [ ] "TvParty" mode for synchronized multi-viewer watching.
-- [ ] Docker images release
+- [ x ] Docker images release
 - [ ] Enriched context using the IMDB API.
 - [ ] Watch history and automatic resume.
 - [ ] Advanced filters (genre, year, rating, resolution).
@@ -208,7 +209,6 @@ To stop:
 ```bash
 docker compose down
 ```
-
 ---
 
 ## Environment Variables
