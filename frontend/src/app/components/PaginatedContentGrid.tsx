@@ -15,6 +15,9 @@ interface PaginatedContentGridProps {
     onOpenDetails?: (item: ContentItem) => void;
     onOpenSchedule?: (item: ContentItem) => void;
     onOpenRecordings?: (item: ContentItem) => void;
+    isFavoritesView?: boolean;
+    favoriteIds?: Set<string>;
+    onToggleFavorite?: (item: ContentItem) => void;
 }
 
 export function PaginatedContentGrid({
@@ -28,6 +31,9 @@ export function PaginatedContentGrid({
     onOpenDetails,
     onOpenSchedule,
     onOpenRecordings,
+    isFavoritesView = false,
+    favoriteIds,
+    onToggleFavorite,
 }: PaginatedContentGridProps) {
     const sentinelRef = useRef<HTMLDivElement>(null);
 
@@ -76,10 +82,18 @@ export function PaginatedContentGrid({
                             onDetails={onOpenDetails ? () => onOpenDetails(item) : undefined}
                             onOpenSchedule={onOpenSchedule ? () => onOpenSchedule(item) : undefined}
                             onOpenRecordings={onOpenRecordings ? () => onOpenRecordings(item) : undefined}
+                            isFavorite={favoriteIds?.has(item.id) ?? false}
+                            onToggleFavorite={onToggleFavorite ? () => onToggleFavorite(item) : undefined}
                         />
                     </motion.div>
                 ))}
             </div>
+
+            {items.length === 0 && !isLoading && isFavoritesView && (
+                <div className={`rounded-xl border px-4 py-6 text-sm ${isDarkMode ? 'border-white/10 text-gray-300 bg-white/5' : 'border-gray-200 text-gray-600 bg-white'}`}>
+                    Aucun favori
+                </div>
+            )}
 
             <div ref={sentinelRef} className="h-10 flex items-center justify-center">
                 {isLoading && (

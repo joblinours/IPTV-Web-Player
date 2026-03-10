@@ -12,9 +12,11 @@ import { LiveRecordingsDialog } from './components/LiveRecordingsDialog';
 import { LiveScheduleDialog } from './components/LiveScheduleDialog';
 import {
     addIptvAccount,
+    addFavorite,
     fetchCategories,
     fetchContentPage,
     fetchEpg,
+    fetchFavorites,
     fetchReplayUrl,
     fetchSeriesInfo,
     fetchStreamUrl,
@@ -23,6 +25,7 @@ import {
     listIptvAccounts,
     login,
     register,
+    removeFavorite,
     type CategoryItem,
     type ContentItem,
     type EpgItem,
@@ -36,13 +39,14 @@ import {
 type CategoryMap = Record<SectionType, CategoryItem[]>;
 type SelectedCategoryMap = Record<SectionType, string>;
 type SeriesStatsMap = Record<number, { seasonsCount: number; episodesCount: number }>;
+type FavoriteIdMap = Record<SectionType, Set<string>>;
 
 const PAGE_SIZE = 50;
 
 const defaultCategories: CategoryMap = {
-    live: [{ id: 'all', name: 'Tous' }],
-    films: [{ id: 'all', name: 'Tous' }],
-    series: [{ id: 'all', name: 'Tous' }],
+    live: [{ id: 'favorites', name: 'Favoris' }, { id: 'all', name: 'Tous' }],
+    films: [{ id: 'favorites', name: 'Favoris' }, { id: 'all', name: 'Tous' }],
+    series: [{ id: 'favorites', name: 'Favoris' }, { id: 'all', name: 'Tous' }],
 };
 
 const defaultSelectedCategories: SelectedCategoryMap = {
@@ -50,6 +54,14 @@ const defaultSelectedCategories: SelectedCategoryMap = {
     films: 'all',
     series: 'all',
 };
+
+function createDefaultFavoriteMap(): FavoriteIdMap {
+    return {
+        live: new Set<string>(),
+        films: new Set<string>(),
+        series: new Set<string>(),
+    };
+}
 
 function uniqueExtensions(extensions: string[]): string[] {
     const seen = new Set<string>();
@@ -108,6 +120,7 @@ export default function App() {
     const [seriesDetailData, setSeriesDetailData] = useState<SeriesInfoResponse | null>(null);
     const [seriesDetailLoading, setSeriesDetailLoading] = useState(false);
     const [seriesStatsMap, setSeriesStatsMap] = useState<SeriesStatsMap>({});
+    const [favoritesBySection, setFavoritesBySection] = useState<FavoriteIdMap>(() => createDefaultFavoriteMap());
 
     const [recordingsOpen, setRecordingsOpen] = useState(false);
     const [recordingsTitle, setRecordingsTitle] = useState('');
@@ -192,7 +205,10 @@ export default function App() {
 
             } catch {
                 if (!cancelled) {
-                    setCategoriesBySection((prev) => ({ ...prev, [activeSection]: [{ id: 'all', name: 'Tous' }] }));
+                    setCategoriesBySection((prev) => ({
+                        ...prev,
+                        [activeSection]: [{ id: 'favorites', name: 'Favoris' }, { id: 'all', name: 'Tous' }],
+                    }));
                     setSelectedCategories((prev) => ({ ...prev, [activeSection]: 'all' }));
                 }
             }
@@ -204,6 +220,37 @@ export default function App() {
             cancelled = true;
         };
     }, [activeSection, accountId, selectedCategories, token]);
+
+    useEffect(() => {
+        if (!token || !accountId) return;
+
+        let cancelled = false;
+
+        const loadFavorites = async () => {
+            try {
+                const result = await fetchFavorites(token, accountId, activeSection);
+                if (cancelled) return;
+
+                setFavoritesBySection((prev) => ({
+                    ...prev,
+                    [activeSection]: new Set(result.items),
+                }));
+            } catch {
+                if (!cancelled) {
+                    setFavoritesBySection((prev) => ({
+                        ...prev,
+                        [activeSection]: new Set<string>(),
+                    }));
+                }
+            }
+        };
+
+        loadFavorites();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [token, accountId, activeSection]);
 
     useEffect(() => {
         if (!token || !accountId) return;
@@ -386,6 +433,7 @@ export default function App() {
         setRecordingsOpen(false);
         setScheduleOpen(false);
         setSeriesDetailOpen(false);
+        setFavoritesBySection(createDefaultFavoriteMap());
     };
 
     const handleLogout = () => {
@@ -406,7 +454,54 @@ export default function App() {
         setIptvSetupError(null);
         setRecordingsOpen(false);
         setScheduleOpen(false);
+        setFavoritesBySection(createDefaultFavoriteMap());
     };
+
+    const handleToggleFavorite = useCallback(
+        async (item: ContentItem) => {
+            if (!token || !accountId || !item.id) return;
+
+            const itemId = item.id;
+            const wasFavorite = favoritesBySection[activeSection]?.has(itemId) ?? false;
+
+            setFavoritesBySection((prev) => {
+                const nextSet = new Set(prev[activeSection]);
+                if (nextSet.has(itemId)) {
+                    nextSet.delete(itemId);
+                } else {
+                    nextSet.add(itemId);
+                }
+
+                return {
+                    ...prev,
+                    [activeSection]: nextSet,
+                };
+            });
+
+            try {
+                if (wasFavorite) {
+                    await removeFavorite(token, { accountId, section: activeSection, itemId });
+                } else {
+                    await addFavorite(token, { accountId, section: activeSection, itemId });
+                }
+            } catch {
+                setFavoritesBySection((prev) => {
+                    const rollbackSet = new Set(prev[activeSection]);
+                    if (wasFavorite) {
+                        rollbackSet.add(itemId);
+                    } else {
+                        rollbackSet.delete(itemId);
+                    }
+
+                    return {
+                        ...prev,
+                        [activeSection]: rollbackSet,
+                    };
+                });
+            }
+        },
+        [token, accountId, activeSection, favoritesBySection]
+    );
 
     const resolvePlaybackSources = useCallback(
         async (
@@ -653,7 +748,11 @@ export default function App() {
         [token, accountId, recordingsStreamId, recordingsTitle]
     );
 
-    const currentCategories = useMemo(() => categoriesBySection[activeSection], [activeSection, categoriesBySection]);
+    const currentCategories = useMemo(() => {
+        const source = categoriesBySection[activeSection] ?? [];
+        const rest = source.filter((category) => category.id !== 'favorites' && category.id !== 'all');
+        return [{ id: 'favorites', name: 'Favoris' }, { id: 'all', name: 'Tous' }, ...rest];
+    }, [activeSection, categoriesBySection]);
 
     const handleCategoryChange = (categoryId: string) => {
         setSelectedCategories((prev) => ({ ...prev, [activeSection]: categoryId }));
@@ -728,6 +827,9 @@ export default function App() {
                                 onOpenDetails={activeSection === 'series' ? handleOpenSeriesDetails : undefined}
                                 onOpenSchedule={activeSection === 'live' ? handleOpenSchedule : undefined}
                                 onOpenRecordings={activeSection === 'live' ? handleOpenRecordings : undefined}
+                                isFavoritesView={currentCategory === 'favorites'}
+                                favoriteIds={favoritesBySection[activeSection]}
+                                onToggleFavorite={handleToggleFavorite}
                             />
                         </div>
                     </motion.div>

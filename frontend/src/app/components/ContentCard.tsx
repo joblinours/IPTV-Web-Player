@@ -20,6 +20,8 @@ interface ContentCardProps {
   onDetails?: () => void;
   onOpenSchedule?: () => void;
   onOpenRecordings?: () => void;
+  isFavorite?: boolean;
+  onToggleFavorite?: () => void;
 }
 
 export function ContentCard({
@@ -39,6 +41,8 @@ export function ContentCard({
   onDetails,
   onOpenSchedule,
   onOpenRecordings,
+  isFavorite = false,
+  onToggleFavorite,
 }: ContentCardProps) {
   const [isHovered, setIsHovered] = useState(false);
 
@@ -186,6 +190,22 @@ export function ContentCard({
               >
                 <Play size={16} fill="currentColor" />
                 <span className="text-sm">Lecture</span>
+              </motion.button>
+
+              <motion.button
+                whileHover={{ scale: 1.1 }}
+                whileTap={{ scale: 0.9 }}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onToggleFavorite?.();
+                }}
+                className={`p-2 rounded-lg border transition-colors ${isDarkMode
+                  ? 'bg-white/10 hover:bg-white/20 border-white/20'
+                  : 'bg-gray-100 hover:bg-gray-200 border-gray-300'
+                  }`}
+                aria-label={isFavorite ? 'Retirer des favoris' : 'Ajouter aux favoris'}
+              >
+                <Star size={18} className={isFavorite ? 'text-yellow-500' : ''} fill={isFavorite ? '#EAB308' : 'none'} />
               </motion.button>
 
               <motion.button
