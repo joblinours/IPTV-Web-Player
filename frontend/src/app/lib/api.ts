@@ -111,6 +111,10 @@ interface ContentResponse {
   pagination: Pagination;
 }
 
+interface FavoritesResponse {
+  items: string[];
+}
+
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:4000';
 
 function sectionToBackendType(section: SectionType): BackendType {
@@ -169,6 +173,36 @@ export async function fetchCategories(token: string, accountId: number, section:
   const type = sectionToBackendType(section);
   const query = new URLSearchParams({ accountId: String(accountId), type });
   return request<{ items: CategoryItem[] }>(`/api/iptv/categories?${query.toString()}`, { method: 'GET' }, token);
+}
+
+export async function fetchFavorites(token: string, accountId: number, section: SectionType): Promise<FavoritesResponse> {
+  const type = sectionToBackendType(section);
+  const query = new URLSearchParams({ accountId: String(accountId), type });
+  return request<FavoritesResponse>(`/api/favorites?${query.toString()}`, { method: 'GET' }, token);
+}
+
+export async function addFavorite(token: string, params: { accountId: number; section: SectionType; itemId: string }) {
+  const type = sectionToBackendType(params.section);
+  return request<{ ok: boolean }>(
+    '/api/favorites',
+    {
+      method: 'POST',
+      body: JSON.stringify({ accountId: params.accountId, type, itemId: params.itemId }),
+    },
+    token
+  );
+}
+
+export async function removeFavorite(token: string, params: { accountId: number; section: SectionType; itemId: string }) {
+  const type = sectionToBackendType(params.section);
+  return request<{ ok: boolean }>(
+    '/api/favorites',
+    {
+      method: 'DELETE',
+      body: JSON.stringify({ accountId: params.accountId, type, itemId: params.itemId }),
+    },
+    token
+  );
 }
 
 export async function fetchContentPage(

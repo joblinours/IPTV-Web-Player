@@ -197,6 +197,24 @@ function initDb() {
       payload TEXT NOT NULL,
       expires_at INTEGER NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS favorites (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      account_id INTEGER NOT NULL,
+      type TEXT NOT NULL CHECK(type IN ('live', 'vod', 'series')),
+      item_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id),
+      FOREIGN KEY(account_id) REFERENCES iptv_accounts(id),
+      UNIQUE(user_id, account_id, type, item_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_favorites_user_account_type
+      ON favorites(user_id, account_id, type);
+
+    CREATE INDEX IF NOT EXISTS idx_favorites_item
+      ON favorites(item_id);
   `);
 }
 
@@ -280,6 +298,12 @@ function getActionForContent(type: ContentType): string {
   if (type === 'live') return 'get_live_streams';
   if (type === 'vod') return 'get_vod_streams';
   return 'get_series';
+}
+
+function getXtreamItemId(type: ContentType, entry: XtreamStream): string | null {
+  const rawId = type === 'series' ? entry.series_id : entry.stream_id;
+  if (rawId === undefined || rawId === null) return null;
+  return String(rawId);
 }
 
 function encodeCursor(offset: number): string {
@@ -380,6 +404,90 @@ app.get('/api/iptv/accounts', { preHandler: [app.authenticate] }, async (request
   return { items: rows };
 });
 
+app.get('/api/favorites', { preHandler: [app.authenticate] }, async (request: any, reply) => {
+  const querySchema = z.object({
+    accountId: z.coerce.number().int().positive(),
+    type: z.enum(['live', 'vod', 'series']),
+  });
+
+  const parsed = querySchema.safeParse(request.query);
+  if (!parsed.success) {
+    return reply.code(400).send({ message: 'Invalid query' });
+  }
+
+  const account = db
+    .prepare('SELECT id FROM iptv_accounts WHERE id = ? AND user_id = ?')
+    .get(parsed.data.accountId, request.user.userId) as { id: number } | undefined;
+
+  if (!account) {
+    return reply.code(404).send({ message: 'Account not found' });
+  }
+
+  const rows = db
+    .prepare('SELECT item_id FROM favorites WHERE user_id = ? AND account_id = ? AND type = ? ORDER BY id DESC')
+    .all(request.user.userId, parsed.data.accountId, parsed.data.type) as { item_id: string }[];
+
+  return { items: rows.map((row) => row.item_id) };
+});
+
+app.post('/api/favorites', { preHandler: [app.authenticate] }, async (request: any, reply) => {
+  const bodySchema = z.object({
+    accountId: z.coerce.number().int().positive(),
+    type: z.enum(['live', 'vod', 'series']),
+    itemId: z.string().min(1),
+  });
+
+  const parsed = bodySchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ message: 'Invalid payload' });
+  }
+
+  const account = db
+    .prepare('SELECT id FROM iptv_accounts WHERE id = ? AND user_id = ?')
+    .get(parsed.data.accountId, request.user.userId) as { id: number } | undefined;
+
+  if (!account) {
+    return reply.code(404).send({ message: 'Account not found' });
+  }
+
+  db.prepare(
+    `INSERT OR IGNORE INTO favorites(user_id, account_id, type, item_id, created_at)
+     VALUES (?, ?, ?, ?, ?)`
+  ).run(request.user.userId, parsed.data.accountId, parsed.data.type, parsed.data.itemId, nowEpoch());
+
+  return { ok: true };
+});
+
+app.delete('/api/favorites', { preHandler: [app.authenticate] }, async (request: any, reply) => {
+  const bodySchema = z.object({
+    accountId: z.coerce.number().int().positive(),
+    type: z.enum(['live', 'vod', 'series']),
+    itemId: z.string().min(1),
+  });
+
+  const parsed = bodySchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ message: 'Invalid payload' });
+  }
+
+  const account = db
+    .prepare('SELECT id FROM iptv_accounts WHERE id = ? AND user_id = ?')
+    .get(parsed.data.accountId, request.user.userId) as { id: number } | undefined;
+
+  if (!account) {
+    return reply.code(404).send({ message: 'Account not found' });
+  }
+
+  db.prepare('DELETE FROM favorites WHERE user_id = ? AND account_id = ? AND type = ? AND item_id = ?').run(
+    request.user.userId,
+    parsed.data.accountId,
+    parsed.data.type,
+    parsed.data.itemId
+  );
+
+  return { ok: true };
+});
+
 app.get('/api/iptv/categories', { preHandler: [app.authenticate] }, async (request: any, reply) => {
   const querySchema = z.object({
     accountId: z.coerce.number().int().positive(),
@@ -410,7 +518,11 @@ app.get('/api/iptv/categories', { preHandler: [app.authenticate] }, async (reque
     setCache(cacheKey, categories, env.cacheTtlSeconds);
   }
 
-  const mapped = [{ id: 'all', name: 'Tous' }, ...categories.map((item) => ({ id: item.category_id, name: item.category_name }))];
+  const mapped = [
+    { id: 'favorites', name: 'Favoris' },
+    { id: 'all', name: 'Tous' },
+    ...categories.map((item) => ({ id: item.category_id, name: item.category_name })),
+  ];
 
   return { items: mapped };
 });
@@ -441,14 +553,16 @@ app.get('/api/iptv/content', { preHandler: [app.authenticate] }, async (request:
     return reply.code(404).send({ message: 'Account not found' });
   }
 
-  const scopedCategory = parsed.data.categoryId === 'all' ? 'all' : parsed.data.categoryId;
+  const scopedCategory = parsed.data.categoryId === 'all' || parsed.data.categoryId === 'favorites'
+    ? 'all'
+    : parsed.data.categoryId;
   const cacheKey = `cnt:${account.id}:${parsed.data.type}:${scopedCategory}`;
   let items = getCache<XtreamStream[]>(cacheKey);
 
   if (!items) {
     const action = getActionForContent(parsed.data.type);
     const actionParams: Record<string, string> = {};
-    if (parsed.data.categoryId !== 'all') {
+    if (parsed.data.categoryId !== 'all' && parsed.data.categoryId !== 'favorites') {
       actionParams.category_id = parsed.data.categoryId;
     }
 
@@ -458,10 +572,22 @@ app.get('/api/iptv/content', { preHandler: [app.authenticate] }, async (request:
 
   const search = parsed.data.search.trim().toLowerCase();
   const categoryId = parsed.data.categoryId;
+  const favoriteIds = categoryId === 'favorites'
+    ? new Set(
+      (
+        db
+          .prepare('SELECT item_id FROM favorites WHERE user_id = ? AND account_id = ? AND type = ?')
+          .all(request.user.userId, account.id, parsed.data.type) as { item_id: string }[]
+      ).map((row) => row.item_id)
+    )
+    : null;
 
   const filtered = items.filter((entry) => {
     const entryCategory = String(entry.category_id ?? '');
-    const categoryMatch = categoryId === 'all' || entryCategory === categoryId;
+    const itemId = getXtreamItemId(parsed.data.type, entry);
+    const categoryMatch = categoryId === 'favorites'
+      ? !!itemId && favoriteIds?.has(itemId)
+      : categoryId === 'all' || entryCategory === categoryId;
     if (!categoryMatch) return false;
 
     if (!search) return true;
