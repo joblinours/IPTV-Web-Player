@@ -1,8 +1,17 @@
-import { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import Hls from 'hls.js';
-import { X, SkipForward } from 'lucide-react';
+import { Maximize, Minimize, Pause, Play, RotateCcw, RotateCw, SkipForward, Volume2, VolumeX, X } from 'lucide-react';
 
 const AUTOPLAY_COUNTDOWN_START = 5;
+
+function fmtTime(sec: number): string {
+    if (!Number.isFinite(sec) || sec < 0) return '0:00';
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = Math.floor(sec % 60);
+    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    return `${m}:${String(s).padStart(2, '0')}`;
+}
 
 interface VideoPlayerModalProps {
     open: boolean;
@@ -44,9 +53,10 @@ export function VideoPlayerModal({
     onTranscodeFallback,
 }: VideoPlayerModalProps) {
     const videoRef = useRef<HTMLVideoElement>(null);
+    const containerRef = useRef<HTMLDivElement>(null);
     const allSources = streamSources.length > 0 ? streamSources : streamUrl ? [streamUrl] : [];
 
-    // Use refs for callbacks/values that should not restart the video effect
+    // Stable refs for callbacks — changing these never re-triggers the main video effect
     const startTimeRef = useRef(startTime);
     startTimeRef.current = startTime;
     const onProgressRef = useRef(onProgress);
@@ -63,36 +73,38 @@ export function VideoPlayerModal({
     realDurationRef.current = realDuration;
     const onTranscodeFallbackRef = useRef(onTranscodeFallback);
     onTranscodeFallbackRef.current = onTranscodeFallback;
+
     const activeSourceUrlRef = useRef<string | null>(null);
-
+    // Seconds already consumed by a backend -ss seek (ffmpeg seekSeconds param).
+    // videoElement.currentTime is relative to this offset.
+    const seekOffsetRef = useRef(0);
     const progressThrottleRef = useRef<number>(0);
-    // Tracks whether the active source is the ffmpeg transcode fallback
     const isTranscodeModeRef = useRef(false);
+    const controlsTimeoutRef = useRef<number | null>(null);
+
+    // ── Custom player UI state ───────────────────────────────────────────────
+    const [isPlaying, setIsPlaying] = useState(false);
+    // currentTimeSec = videoElement.currentTime + seekOffset  (true position in the media)
+    const [currentTimeSec, setCurrentTimeSec] = useState(0);
+    const [effectiveDuration, setEffectiveDuration] = useState(0);
+    const [bufferedEnd, setBufferedEnd] = useState(0);
+    const [volume, setVolume] = useState(1);
+    const [isMuted, setIsMuted] = useState(false);
+    const [isFullscreen, setIsFullscreen] = useState(false);
+    const [showControls, setShowControls] = useState(true);
     const [autoplayCountdown, setAutoplayCountdown] = useState<number | null>(null);
+    // isDragging: pointer is held on the seek bar
+    const [isDragging, setIsDragging] = useState(false);
+    const seekBarRef = useRef<HTMLDivElement>(null);
 
-    const syncNativeDurationDisplay = (videoElement: HTMLVideoElement) => {
-        try {
-            delete (videoElement as HTMLVideoElement & { duration?: number }).duration;
-        } catch {
-            // noop
-        }
+    // ── Controls auto-hide ───────────────────────────────────────────────────
+    const resetControlsTimeout = useCallback(() => {
+        setShowControls(true);
+        if (controlsTimeoutRef.current) window.clearTimeout(controlsTimeoutRef.current);
+        controlsTimeoutRef.current = window.setTimeout(() => setShowControls(false), 3000);
+    }, []);
 
-        if (!isTranscodeModeRef.current || !realDurationRef.current || realDurationRef.current <= 0) {
-            return;
-        }
-
-        try {
-            Object.defineProperty(videoElement, 'duration', {
-                configurable: true,
-                get: () => realDurationRef.current ?? 0,
-            });
-            videoElement.dispatchEvent(new Event('durationchange'));
-        } catch {
-            // Some browsers do not allow overriding the instance getter.
-        }
-    };
-
-    // Countdown timer
+    // ── Autoplay countdown ───────────────────────────────────────────────────
     useEffect(() => {
         if (autoplayCountdown === null) return;
         if (autoplayCountdown === 0) {
@@ -100,20 +112,68 @@ export function VideoPlayerModal({
             setAutoplayCountdown(null);
             return;
         }
-        const timer = window.setTimeout(
-            () => setAutoplayCountdown((prev: number | null) => (prev !== null ? prev - 1 : null)),
+        const t = window.setTimeout(
+            () => setAutoplayCountdown((p: number | null) => (p !== null ? p - 1 : null)),
             1000
         );
-        return () => window.clearTimeout(timer);
+        return () => window.clearTimeout(t);
     }, [autoplayCountdown]);
 
-    // Reset countdown when player closes
+    // ── Reset when modal closes ──────────────────────────────────────────────
     useEffect(() => {
         if (!open) {
             setAutoplayCountdown(null);
+            setIsPlaying(false);
+            setCurrentTimeSec(0);
+            setEffectiveDuration(0);
+            setBufferedEnd(0);
+            setShowControls(true);
         }
     }, [open]);
 
+    // ── Fullscreen listener ──────────────────────────────────────────────────
+    useEffect(() => {
+        const onFsChange = () => setIsFullscreen(!!document.fullscreenElement);
+        document.addEventListener('fullscreenchange', onFsChange);
+        return () => document.removeEventListener('fullscreenchange', onFsChange);
+    }, []);
+
+    // ── Keyboard shortcuts ───────────────────────────────────────────────────
+    useEffect(() => {
+        if (!open) return;
+        const onKey = (e: KeyboardEvent) => {
+            const tag = (e.target as HTMLElement)?.tagName;
+            if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+            const v = videoRef.current;
+            if (!v) return;
+            if (e.code === 'Space') {
+                e.preventDefault();
+                v.paused ? v.play().catch(() => undefined) : v.pause();
+                resetControlsTimeout();
+            } else if (e.code === 'ArrowLeft') {
+                e.preventDefault();
+                v.currentTime = Math.max(0, v.currentTime - 10);
+                resetControlsTimeout();
+            } else if (e.code === 'ArrowRight') {
+                e.preventDefault();
+                v.currentTime = v.currentTime + 10;
+                resetControlsTimeout();
+            } else if (e.code === 'KeyF') {
+                e.preventDefault();
+                document.fullscreenElement
+                    ? document.exitFullscreen()
+                    : containerRef.current?.requestFullscreen();
+            } else if (e.code === 'KeyM') {
+                e.preventDefault();
+                v.muted = !v.muted;
+                setIsMuted(v.muted);
+            }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+    }, [open, resetControlsTimeout]);
+
+    // ── Main video management effect ─────────────────────────────────────────
     useEffect(() => {
         if (!open || allSources.length === 0 || !videoRef.current) return;
 
@@ -124,9 +184,12 @@ export function VideoPlayerModal({
         let switchedByWatchdog = false;
         let didSeek = false;
 
-        // Reset transcode mode for this new playback session
         isTranscodeModeRef.current = false;
         activeSourceUrlRef.current = null;
+        seekOffsetRef.current = 0;
+        setCurrentTimeSec(0);
+        setEffectiveDuration(0);
+        setBufferedEnd(0);
 
         const clearWatchdog = () => {
             if (watchdogTimer !== null) {
@@ -146,10 +209,7 @@ export function VideoPlayerModal({
         const startWatchdog = (url: string) => {
             clearWatchdog();
             switchedByWatchdog = false;
-
-            if (url.includes('/api/iptv/transcode')) {
-                return;
-            }
+            if (url.includes('/api/iptv/transcode')) return;
 
             let stableChecks = 0;
             let lastVideoDecoded = -1;
@@ -163,7 +223,6 @@ export function VideoPlayerModal({
 
                 const videoDecoded = Number((videoElement as any).webkitDecodedFrameCount ?? -1);
                 const audioDecoded = Number((videoElement as any).webkitAudioDecodedByteCount ?? -1);
-
                 const noPicture = videoElement.videoWidth === 0 || videoDecoded === 0;
                 const noAudio = !videoElement.muted && audioDecoded === 0;
 
@@ -174,11 +233,11 @@ export function VideoPlayerModal({
                 }
 
                 if (videoDecoded >= 0 && audioDecoded >= 0) {
-                    const stalled = videoDecoded === lastVideoDecoded && audioDecoded === lastAudioDecoded;
+                    const stalled =
+                        videoDecoded === lastVideoDecoded && audioDecoded === lastAudioDecoded;
                     stableChecks = stalled ? stableChecks + 1 : 0;
                     lastVideoDecoded = videoDecoded;
                     lastAudioDecoded = audioDecoded;
-
                     if (stableChecks >= 3) {
                         switchedByWatchdog = true;
                         tryNextSource();
@@ -188,11 +247,7 @@ export function VideoPlayerModal({
         };
 
         const loadSource = (url: string) => {
-            if (hls) {
-                hls.destroy();
-                hls = null;
-            }
-
+            if (hls) { hls.destroy(); hls = null; }
             clearWatchdog();
             didSeek = false;
             activeSourceUrlRef.current = url;
@@ -200,22 +255,26 @@ export function VideoPlayerModal({
             videoElement.removeAttribute('src');
             videoElement.load();
 
-            // Detect switch to ffmpeg transcode fallback
+            // Extract the seek offset already applied server-side
+            const seekMatch = url.match(/[?&]seekSeconds=(\d+(?:\.\d+)?)/);
+            const newOffset = seekMatch ? parseFloat(seekMatch[1]) : 0;
+            seekOffsetRef.current = newOffset;
+            if (newOffset > 0) setCurrentTimeSec(newOffset);
+
             if (url.includes('/api/iptv/transcode') && !isTranscodeModeRef.current) {
                 isTranscodeModeRef.current = true;
                 onTranscodeFallbackRef.current?.();
+                // Update effective duration now that we know it's transcode
+                const rd = realDurationRef.current;
+                if (rd && rd > 0) setEffectiveDuration(rd);
             }
-
-            syncNativeDurationDisplay(videoElement);
 
             if (url.endsWith('.m3u8') && Hls.isSupported()) {
                 hls = new Hls();
                 hls.loadSource(url);
                 hls.attachMedia(videoElement);
-                hls.on(Hls.Events.ERROR, (_event: string, data: { fatal: boolean }) => {
-                    if (data.fatal) {
-                        tryNextSource();
-                    }
+                hls.on(Hls.Events.ERROR, (_: string, data: { fatal: boolean }) => {
+                    if (data.fatal) tryNextSource();
                 });
             } else {
                 videoElement.src = url;
@@ -225,54 +284,72 @@ export function VideoPlayerModal({
             startWatchdog(url);
         };
 
-        const handleError = () => {
-            tryNextSource();
+        const refreshDuration = () => {
+            const dur =
+                isTranscodeModeRef.current && realDurationRef.current && realDurationRef.current > 0
+                    ? realDurationRef.current
+                    : Number.isFinite(videoElement.duration) && videoElement.duration > 0
+                    ? videoElement.duration
+                    : 0;
+            setEffectiveDuration(dur);
         };
 
+        const handleError = () => tryNextSource();
+
         const handleCanPlay = () => {
-            syncNativeDurationDisplay(videoElement);
+            refreshDuration();
+            const hasBackendSeek =
+                !!activeSourceUrlRef.current &&
+                activeSourceUrlRef.current.includes('/api/iptv/transcode') &&
+                activeSourceUrlRef.current.includes('seekSeconds=');
 
-            if (!didSeek) {
+            if (!didSeek && !hasBackendSeek) {
                 const st = startTimeRef.current;
-                const activeUrl = activeSourceUrlRef.current;
-                const hasBackendSeek =
-                    !!activeUrl && activeUrl.includes('/api/iptv/transcode') && activeUrl.includes('seekSeconds=');
-
-                if (st && st > 0 && !hasBackendSeek) {
+                if (st && st > 0) {
                     didSeek = true;
                     videoElement.currentTime = st;
                 }
+            } else {
+                didSeek = true; // already at correct position via backend seek
             }
         };
 
+        const handleDurationChange = () => refreshDuration();
+
         const handleTimeUpdate = () => {
+            const effectiveCt = videoElement.currentTime + seekOffsetRef.current;
+            setCurrentTimeSec(effectiveCt);
+
+            if (videoElement.buffered.length > 0) {
+                setBufferedEnd(
+                    videoElement.buffered.end(videoElement.buffered.length - 1) +
+                        seekOffsetRef.current
+                );
+            }
+
             const cb = onProgressRef.current;
             if (!cb) return;
             const now = Date.now();
             if (now - progressThrottleRef.current < 5000) return;
             progressThrottleRef.current = now;
-            const ct = videoElement.currentTime;
-            if (ct <= 0) return;
-            // When transcoding, videoElement.duration only reflects the transcoded portion.
-            // Use realDuration if provided, otherwise pass 0 so the backend never
-            // auto-marks the item as watched based on an unreliable duration.
-            const isTranscode = isTranscodeModeRef.current;
-            const dur = isTranscode
+            if (effectiveCt <= 0) return;
+            const dur = isTranscodeModeRef.current
                 ? (realDurationRef.current ?? 0)
                 : videoElement.duration;
-            if (Number.isFinite(ct)) {
-                cb(ct, Number.isFinite(dur) ? dur : 0);
-            }
+            cb(effectiveCt, Number.isFinite(dur) ? dur : 0);
         };
 
+        const handlePlay = () => setIsPlaying(true);
+        const handlePause = () => setIsPlaying(false);
+
         const handleEnded = () => {
-            const isTranscode = isTranscodeModeRef.current;
+            setIsPlaying(false);
             const realDur = realDurationRef.current;
             const nativeDur = Number.isFinite(videoElement.duration) ? videoElement.duration : 0;
-            const dur = isTranscode && realDur && realDur > 0 ? realDur : nativeDur;
-            const ct = dur > 0 ? dur : videoElement.currentTime;
+            const dur =
+                isTranscodeModeRef.current && realDur && realDur > 0 ? realDur : nativeDur;
+            const ct = dur > 0 ? dur : videoElement.currentTime + seekOffsetRef.current;
             onEndedRef.current?.(ct, dur);
-
             if (autoplayRef.current && nextEpisodeTitleRef.current && onNextEpisodeRef.current) {
                 setAutoplayCountdown(AUTOPLAY_COUNTDOWN_START);
             }
@@ -281,7 +358,10 @@ export function VideoPlayerModal({
         videoElement.addEventListener('error', handleError);
         videoElement.addEventListener('canplay', handleCanPlay);
         videoElement.addEventListener('timeupdate', handleTimeUpdate);
+        videoElement.addEventListener('durationchange', handleDurationChange);
         videoElement.addEventListener('ended', handleEnded);
+        videoElement.addEventListener('play', handlePlay);
+        videoElement.addEventListener('pause', handlePause);
         loadSource(allSources[sourceIndex]);
 
         return () => {
@@ -289,34 +369,236 @@ export function VideoPlayerModal({
             videoElement.removeEventListener('error', handleError);
             videoElement.removeEventListener('canplay', handleCanPlay);
             videoElement.removeEventListener('timeupdate', handleTimeUpdate);
+            videoElement.removeEventListener('durationchange', handleDurationChange);
             videoElement.removeEventListener('ended', handleEnded);
+            videoElement.removeEventListener('play', handlePlay);
+            videoElement.removeEventListener('pause', handlePause);
             videoElement.pause();
             videoElement.removeAttribute('src');
             videoElement.load();
-            try {
-                delete (videoElement as HTMLVideoElement & { duration?: number }).duration;
-            } catch {
-                // noop
-            }
-            if (hls) {
-                hls.destroy();
-            }
+            if (hls) hls.destroy();
         };
     }, [open, streamUrl, allSources]);
+
+    // ── Seek bar interaction ─────────────────────────────────────────────────
+    const seekToRatio = (ratio: number) => {
+        const v = videoRef.current;
+        if (!v || effectiveDuration <= 0) return;
+        const clamped = Math.max(0, Math.min(1, ratio));
+        const targetEffectiveTime = clamped * effectiveDuration;
+        // Adjust for the server-side seek offset already baked into the stream
+        v.currentTime = Math.max(0, targetEffectiveTime - seekOffsetRef.current);
+        setCurrentTimeSec(targetEffectiveTime);
+    };
+
+    const ratioFromMouseEvent = (e: React.MouseEvent<HTMLDivElement> | globalThis.MouseEvent) => {
+        const bar = seekBarRef.current;
+        if (!bar) return 0;
+        const rect = bar.getBoundingClientRect();
+        return (e.clientX - rect.left) / rect.width;
+    };
+
+    const handleSeekBarMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+        e.preventDefault();
+        setIsDragging(true);
+        seekToRatio(ratioFromMouseEvent(e));
+        resetControlsTimeout();
+    };
+
+    useEffect(() => {
+        if (!isDragging) return;
+        const onMove = (e: globalThis.MouseEvent) => seekToRatio(ratioFromMouseEvent(e));
+        const onUp = () => setIsDragging(false);
+        window.addEventListener('mousemove', onMove);
+        window.addEventListener('mouseup', onUp);
+        return () => {
+            window.removeEventListener('mousemove', onMove);
+            window.removeEventListener('mouseup', onUp);
+        };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [isDragging, effectiveDuration]);
+
+    // ── Control actions ──────────────────────────────────────────────────────
+    const handlePlayPause = (e: React.MouseEvent) => {
+        e.stopPropagation();
+        const v = videoRef.current;
+        if (!v) return;
+        v.paused ? v.play().catch(() => undefined) : v.pause();
+        resetControlsTimeout();
+    };
+
+    const handleSkip = (e: React.MouseEvent, seconds: number) => {
+        e.stopPropagation();
+        const v = videoRef.current;
+        if (!v) return;
+        v.currentTime = Math.max(0, v.currentTime + seconds);
+        resetControlsTimeout();
+    };
+
+    const handleVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+        const v = videoRef.current;
+        if (!v) return;
+        const val = parseFloat(e.target.value);
+        v.volume = val;
+        v.muted = val === 0;
+        setVolume(val);
+        setIsMuted(val === 0);
+        resetControlsTimeout();
+    };
+
+    const handleToggleMute = (e: React.MouseEvent) => {
+        e.stopPropagation();
+        const v = videoRef.current;
+        if (!v) return;
+        v.muted = !v.muted;
+        setIsMuted(v.muted);
+        resetControlsTimeout();
+    };
+
+    const handleToggleFullscreen = (e: React.MouseEvent) => {
+        e.stopPropagation();
+        document.fullscreenElement
+            ? document.exitFullscreen()
+            : containerRef.current?.requestFullscreen();
+        resetControlsTimeout();
+    };
+
+    // ── Derived display values ───────────────────────────────────────────────
+    const progressPct = effectiveDuration > 0 ? (currentTimeSec / effectiveDuration) * 100 : 0;
+    const bufferedPct =
+        effectiveDuration > 0
+            ? (Math.min(bufferedEnd, effectiveDuration) / effectiveDuration) * 100
+            : 0;
 
     if (!open) return null;
 
     return (
         <div className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
             <div className="w-full max-w-5xl bg-black border border-white/10 rounded-2xl overflow-hidden">
+                {/* Header */}
                 <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
                     <h3 className="text-white font-semibold truncate">{title}</h3>
                     <button onClick={onClose} className="p-2 rounded-lg hover:bg-white/10 text-white">
                         <X size={18} />
                     </button>
                 </div>
-                <div className="aspect-video bg-black relative">
-                    <video ref={videoRef} controls className="w-full h-full" playsInline />
+
+                {/* Video area with custom controls */}
+                <div
+                    ref={containerRef}
+                    className="aspect-video bg-black relative select-none"
+                    style={{ cursor: showControls || !isPlaying ? 'default' : 'none' }}
+                    onMouseMove={resetControlsTimeout}
+                    onClick={handlePlayPause}
+                >
+                    <video ref={videoRef} className="w-full h-full" playsInline />
+
+                    {/* Controls overlay — auto-hides during playback */}
+                    <div
+                        className={`absolute inset-0 flex flex-col justify-end transition-opacity duration-300 ${
+                            showControls || !isPlaying ? 'opacity-100' : 'opacity-0 pointer-events-none'
+                        }`}
+                        onClick={(e: React.MouseEvent) => e.stopPropagation()}
+                    >
+                        {/* Gradient scrim */}
+                        <div className="absolute inset-0 bg-gradient-to-t from-black/75 via-transparent to-transparent pointer-events-none" />
+
+                        <div className="relative z-10 px-4 pb-4 pt-2 flex flex-col gap-2">
+                            {/* ── Seek bar ── */}
+                            <div
+                                ref={seekBarRef}
+                                className="w-full h-4 flex items-center cursor-pointer group"
+                                onMouseDown={handleSeekBarMouseDown}
+                            >
+                                <div className="relative w-full h-1 group-hover:h-1.5 transition-all duration-150 rounded-full bg-white/20">
+                                    {/* Buffered */}
+                                    <div
+                                        className="absolute inset-y-0 left-0 bg-white/35 rounded-full"
+                                        style={{ width: `${bufferedPct}%` }}
+                                    />
+                                    {/* Played */}
+                                    <div
+                                        className="absolute inset-y-0 left-0 bg-red-500 rounded-full"
+                                        style={{ width: `${progressPct}%` }}
+                                    >
+                                        <div
+                                            className={`absolute right-0 top-1/2 -translate-y-1/2 translate-x-1/2 w-3 h-3 bg-white rounded-full shadow-md transition-opacity ${
+                                                isDragging ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                                            }`}
+                                        />
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* ── Bottom controls row ── */}
+                            <div className="flex items-center gap-3">
+                                {/* Play / Pause */}
+                                <button
+                                    onClick={handlePlayPause}
+                                    className="text-white hover:text-red-400 transition-colors shrink-0"
+                                    aria-label={isPlaying ? 'Pause' : 'Lecture'}
+                                >
+                                    {isPlaying ? <Pause size={20} fill="currentColor" /> : <Play size={20} fill="currentColor" />}
+                                </button>
+
+                                {/* Skip −10 s */}
+                                <button
+                                    onClick={(e: React.MouseEvent) => handleSkip(e, -10)}
+                                    className="text-white hover:text-red-400 transition-colors shrink-0"
+                                    aria-label="Reculer 10 secondes"
+                                >
+                                    <RotateCcw size={16} />
+                                </button>
+
+                                {/* Skip +10 s */}
+                                <button
+                                    onClick={(e: React.MouseEvent) => handleSkip(e, 10)}
+                                    className="text-white hover:text-red-400 transition-colors shrink-0"
+                                    aria-label="Avancer 10 secondes"
+                                >
+                                    <RotateCw size={16} />
+                                </button>
+
+                                {/* Volume */}
+                                <div className="flex items-center gap-1.5 group/vol shrink-0">
+                                    <button
+                                        onClick={handleToggleMute}
+                                        className="text-white hover:text-red-400 transition-colors"
+                                        aria-label={isMuted ? 'Activer le son' : 'Couper le son'}
+                                    >
+                                        {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+                                    </button>
+                                    <input
+                                        type="range"
+                                        min={0}
+                                        max={1}
+                                        step={0.05}
+                                        value={isMuted ? 0 : volume}
+                                        onChange={handleVolumeChange}
+                                        onClick={(e: React.MouseEvent) => e.stopPropagation()}
+                                        className="w-0 group-hover/vol:w-16 overflow-hidden transition-all duration-200 accent-red-500 cursor-pointer"
+                                        aria-label="Volume"
+                                    />
+                                </div>
+
+                                {/* Time display */}
+                                <span className="text-white/90 text-xs font-mono tabular-nums ml-1 shrink-0">
+                                    {fmtTime(currentTimeSec)}&nbsp;/&nbsp;{effectiveDuration > 0 ? fmtTime(effectiveDuration) : '--:--'}
+                                </span>
+
+                                <div className="flex-1" />
+
+                                {/* Fullscreen */}
+                                <button
+                                    onClick={handleToggleFullscreen}
+                                    className="text-white hover:text-red-400 transition-colors shrink-0"
+                                    aria-label={isFullscreen ? 'Quitter le plein écran' : 'Plein écran'}
+                                >
+                                    {isFullscreen ? <Minimize size={18} /> : <Maximize size={18} />}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
 
                     {/* Autoplay countdown overlay */}
                     {autoplayCountdown !== null && (
@@ -348,9 +630,6 @@ export function VideoPlayerModal({
                             </div>
                         </div>
                     )}
-                </div>
-                <div className="px-4 py-3 border-t border-white/10 text-xs text-gray-400">
-                    Certains flux (ex: MKV avec codecs non supportés navigateur) peuvent être muets/non lisibles. Le lecteur tente automatiquement plusieurs formats.
                 </div>
             </div>
         </div>
