@@ -33,6 +33,8 @@ type XtreamStream = {
   tv_archive?: number | string;
   tv_archive_duration?: number | string;
   epg_channel_id?: string;
+  duration?: string;
+  duration_secs?: number | string;
 };
 
 type XtreamSeriesEpisode = {
@@ -91,6 +93,7 @@ const env = {
   encryptionSecret: process.env.APP_ENCRYPTION_SECRET ?? 'change-me-32-char-minimum-secret',
   corsOrigin: process.env.CORS_ORIGIN ?? 'http://localhost:5173',
   cacheTtlSeconds: Number(process.env.CACHE_TTL_SECONDS ?? 120),
+  streamProxyTimeoutMs: Number(process.env.STREAM_PROXY_TIMEOUT_MS ?? 20000),
 };
 
 if (env.encryptionSecret.length < 32) {
@@ -566,7 +569,10 @@ app.post('/api/progress', { preHandler: [app.authenticate] }, async (request: an
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(user_id, account_id, type, item_id) DO UPDATE SET
       current_time = excluded.current_time,
-      total_duration = excluded.total_duration,
+      total_duration = CASE
+        WHEN excluded.total_duration > 0 THEN excluded.total_duration
+        ELSE watch_progress.total_duration
+      END,
       is_watched = MAX(watch_progress.is_watched, excluded.is_watched),
       needs_transcode = MAX(watch_progress.needs_transcode, excluded.needs_transcode),
       series_id = COALESCE(excluded.series_id, watch_progress.series_id),
@@ -904,6 +910,8 @@ app.get('/api/iptv/content', { preHandler: [app.authenticate] }, async (request:
       String(entry.tv_archive ?? '0') === '1' || Number(entry.tv_archive_duration ?? 0) > 0,
     archiveDurationHours: Number(entry.tv_archive_duration ?? 0) || null,
     rating: entry.rating ?? null,
+    duration: entry.duration ?? null,
+    durationSeconds: Number(entry.duration_secs ?? 0) > 0 ? Number(entry.duration_secs) : null,
     containerExtension: entry.container_extension ?? null,
     streamId: entry.stream_id ?? null,
     seriesId: entry.series_id ?? null,
@@ -1151,17 +1159,64 @@ app.get('/api/iptv/stream-proxy', async (request: any, reply) => {
     ...(includeRange && incomingRange ? { Range: String(incomingRange) } : {}),
   });
 
-  let upstream = await fetch(sourceUrl, {
-    headers: buildHeaders(true),
-  });
+  const fetchWithTimeout = async (includeRange: boolean) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), env.streamProxyTimeoutMs);
+    try {
+      return await fetch(sourceUrl, {
+        headers: buildHeaders(includeRange),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  let upstream: Response;
+  try {
+    upstream = await fetchWithTimeout(true);
+  } catch (error: any) {
+    const note = error?.name === 'AbortError' ? 'proxy_timeout' : 'proxy_network_error';
+    logPlaybackTrace({
+      route: 'stream-proxy',
+      mode: 'proxy',
+      accountId: parsed.data.accountId,
+      mediaType: parsed.data.type,
+      streamId: parsed.data.streamId,
+      extension,
+      mediaTitle: parsed.data.mediaTitle,
+      seriesTitle: parsed.data.seriesTitle,
+      seasonNumber: parsed.data.seasonNumber,
+      episodeNumber: parsed.data.episodeNumber,
+      note,
+    });
+    return reply.code(504).send({ message: 'Upstream stream timeout' });
+  }
 
   let fallbackWithoutRange = false;
 
   if ((upstream.status === 405 || upstream.status === 416) && incomingRange) {
     fallbackWithoutRange = true;
-    upstream = await fetch(sourceUrl, {
-      headers: buildHeaders(false),
-    });
+    try {
+      upstream = await fetchWithTimeout(false);
+    } catch (error: any) {
+      const note = error?.name === 'AbortError' ? 'proxy_timeout_after_range_fallback' : 'proxy_network_error_after_range_fallback';
+      logPlaybackTrace({
+        route: 'stream-proxy',
+        mode: 'proxy',
+        accountId: parsed.data.accountId,
+        mediaType: parsed.data.type,
+        streamId: parsed.data.streamId,
+        extension,
+        mediaTitle: parsed.data.mediaTitle,
+        seriesTitle: parsed.data.seriesTitle,
+        seasonNumber: parsed.data.seasonNumber,
+        episodeNumber: parsed.data.episodeNumber,
+        fallbackWithoutRange,
+        note,
+      });
+      return reply.code(504).send({ message: 'Upstream stream timeout' });
+    }
   }
 
   logPlaybackTrace({

@@ -31,10 +31,14 @@ interface VideoPlayerModalProps {
     nextEpisodeTitle?: string;
     /** Called when the autoplay countdown reaches zero */
     onNextEpisode?: () => void;
+    /** Called when user requests previous episode navigation */
+    onPreviousEpisode?: () => void;
     /** Real total duration (seconds) of the media, used when transcoding hides the true length */
     realDuration?: number;
     /** Called once when the player switches to the ffmpeg transcode fallback source */
     onTranscodeFallback?: () => void;
+    /** Enable/disable keyboard shortcuts for this player instance */
+    keyboardEnabled?: boolean;
 }
 
 export function VideoPlayerModal({
@@ -49,8 +53,10 @@ export function VideoPlayerModal({
     autoplay = false,
     nextEpisodeTitle,
     onNextEpisode,
+    onPreviousEpisode,
     realDuration,
     onTranscodeFallback,
+    keyboardEnabled = true,
 }: VideoPlayerModalProps) {
     const videoRef = useRef<HTMLVideoElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
@@ -69,6 +75,8 @@ export function VideoPlayerModal({
     nextEpisodeTitleRef.current = nextEpisodeTitle;
     const onNextEpisodeRef = useRef(onNextEpisode);
     onNextEpisodeRef.current = onNextEpisode;
+    const onPreviousEpisodeRef = useRef(onPreviousEpisode);
+    onPreviousEpisodeRef.current = onPreviousEpisode;
     const realDurationRef = useRef(realDuration);
     realDurationRef.current = realDuration;
     const onTranscodeFallbackRef = useRef(onTranscodeFallback);
@@ -140,7 +148,7 @@ export function VideoPlayerModal({
 
     // ── Keyboard shortcuts ───────────────────────────────────────────────────
     useEffect(() => {
-        if (!open) return;
+        if (!open || !keyboardEnabled) return;
         const onKey = (e: KeyboardEvent) => {
             const tag = (e.target as HTMLElement)?.tagName;
             if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
@@ -158,6 +166,14 @@ export function VideoPlayerModal({
                 e.preventDefault();
                 v.currentTime = v.currentTime + 10;
                 resetControlsTimeout();
+            } else if (e.code === 'ArrowUp' && onNextEpisodeRef.current) {
+                e.preventDefault();
+                onNextEpisodeRef.current();
+                resetControlsTimeout();
+            } else if (e.code === 'ArrowDown' && onPreviousEpisodeRef.current) {
+                e.preventDefault();
+                onPreviousEpisodeRef.current();
+                resetControlsTimeout();
             } else if (e.code === 'KeyF') {
                 e.preventDefault();
                 document.fullscreenElement
@@ -171,7 +187,7 @@ export function VideoPlayerModal({
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
-    }, [open, resetControlsTimeout]);
+    }, [open, keyboardEnabled, resetControlsTimeout]);
 
     // ── Main video management effect ─────────────────────────────────────────
     useEffect(() => {
@@ -291,27 +307,27 @@ export function VideoPlayerModal({
                     : Number.isFinite(videoElement.duration) && videoElement.duration > 0
                     ? videoElement.duration
                     : 0;
-            setEffectiveDuration(dur);
+            // Keep last known valid duration to avoid UI regressions to 0 during metadata churn.
+            setEffectiveDuration((previous) => (dur > 0 ? dur : previous));
         };
 
         const handleError = () => tryNextSource();
 
         const handleCanPlay = () => {
             refreshDuration();
-            const hasBackendSeek =
-                !!activeSourceUrlRef.current &&
-                activeSourceUrlRef.current.includes('/api/iptv/transcode') &&
-                activeSourceUrlRef.current.includes('seekSeconds=');
+            if (didSeek) return;
 
-            if (!didSeek && !hasBackendSeek) {
-                const st = startTimeRef.current;
-                if (st && st > 0) {
-                    didSeek = true;
-                    videoElement.currentTime = st;
+            const expectedStart = startTimeRef.current;
+            if (expectedStart && expectedStart > 0) {
+                const effectiveCt = videoElement.currentTime + seekOffsetRef.current;
+                // Correct drift when backend seek and real playback position differ noticeably.
+                if (Math.abs(effectiveCt - expectedStart) > 2) {
+                    const localTarget = Math.max(0, expectedStart - seekOffsetRef.current);
+                    videoElement.currentTime = localTarget;
                 }
-            } else {
-                didSeek = true; // already at correct position via backend seek
             }
+
+            didSeek = true;
         };
 
         const handleDurationChange = () => refreshDuration();
@@ -334,7 +350,13 @@ export function VideoPlayerModal({
             progressThrottleRef.current = now;
             if (effectiveCt <= 0) return;
             const dur = isTranscodeModeRef.current
-                ? (realDurationRef.current ?? 0)
+                ? (
+                      (realDurationRef.current && realDurationRef.current > 0
+                          ? realDurationRef.current
+                          : Number.isFinite(videoElement.duration) && videoElement.duration > 0
+                          ? videoElement.duration
+                          : 0)
+                  )
                 : videoElement.duration;
             cb(effectiveCt, Number.isFinite(dur) ? dur : 0);
         };

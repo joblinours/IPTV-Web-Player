@@ -22,7 +22,6 @@ import {
     fetchSeriesProgress,
     fetchPreferences,
     fetchReplayUrl,
-    fetchStreamUrl,
     buildStreamProxyUrl,
     buildTranscodeUrl,
     listIptvAccounts,
@@ -82,6 +81,31 @@ function findNextEpisode(
             if (nextEps.length > 0) return nextEps[0];
         }
     }
+    return null;
+}
+
+function findPreviousEpisode(
+    seriesData: SeriesInfoResponse,
+    seasonNumber: number,
+    episodeNumber: number
+): SeriesEpisode | null {
+    const seasonKey = String(seasonNumber);
+    const currentSeasonEps = seriesData.episodesBySeason[seasonKey] ?? [];
+    const currentIdx = currentSeasonEps.findIndex((ep) => ep.episodeNumber === episodeNumber);
+    if (currentIdx > 0) {
+        return currentSeasonEps[currentIdx - 1];
+    }
+
+    // Try previous seasons in reverse order.
+    const orderedSeasons = seriesData.seasons.map((s) => s.seasonNumber).sort((a, b) => a - b);
+    const currentSeasonIdx = orderedSeasons.indexOf(seasonNumber);
+    if (currentSeasonIdx > 0) {
+        for (let i = currentSeasonIdx - 1; i >= 0; i--) {
+            const prevEps = seriesData.episodesBySeason[String(orderedSeasons[i])] ?? [];
+            if (prevEps.length > 0) return prevEps[prevEps.length - 1];
+        }
+    }
+
     return null;
 }
 
@@ -677,17 +701,6 @@ export default function App() {
             const urls = await Promise.all(
                 candidates.map(async (extension) => {
                     try {
-                        if (section === 'live') {
-                            const response = await fetchStreamUrl(token, {
-                                accountId,
-                                section,
-                                streamId,
-                                containerExtension: extension,
-                                debugContext,
-                            });
-                            return response.url;
-                        }
-
                         return buildStreamProxyUrl({
                             token,
                             accountId,
@@ -712,6 +725,19 @@ export default function App() {
                         section,
                         streamId,
                         containerExtension: 'mkv',
+                        debugContext,
+                    })
+                );
+            }
+
+            if (section === 'live') {
+                urls.push(
+                    buildTranscodeUrl({
+                        token,
+                        accountId,
+                        section,
+                        streamId,
+                        containerExtension: normalizedContainer || 'ts',
                         debugContext,
                     })
                 );
@@ -915,6 +941,67 @@ export default function App() {
         setPlayerSources(sources);
     }, [token, accountId, currentSeriesPlayContext, resolvePlaybackSources, episodeProgressMap]);
 
+    const handlePreviousEpisode = useCallback(async () => {
+        if (!token || !accountId || !currentSeriesPlayContext) return;
+        const { seriesData, currentEpisode } = currentSeriesPlayContext;
+        const currentSeriesId = currentlyPlayingRef.current?.seriesId;
+
+        const previous = findPreviousEpisode(
+            seriesData,
+            currentEpisode.seasonNumber,
+            currentEpisode.episodeNumber
+        );
+        // At the very first available episode: no-op by design.
+        if (!previous) return;
+
+        const rawSources = await resolvePlaybackSources(
+            {
+                id: String(previous.id),
+                title: previous.title,
+                categoryId: '',
+                poster: previous.poster,
+                description: null,
+                genre: null,
+                year: null,
+                rating: previous.rating ? String(previous.rating) : null,
+                containerExtension: previous.containerExtension,
+                streamId: null,
+                seriesId: previous.id,
+            },
+            'series',
+            previous.id,
+            {
+                mediaTitle: previous.title,
+                seriesTitle: seriesData.info.name,
+                seasonNumber: previous.seasonNumber,
+                episodeNumber: previous.episodeNumber,
+            }
+        );
+
+        if (rawSources.length === 0) return;
+
+        const previousEpProg = episodeProgressMap[String(previous.id)];
+        const sources = previousEpProg?.needsTranscode
+            ? reorderWithTranscodeFirst(rawSources)
+            : rawSources;
+
+        currentlyPlayingRef.current = {
+            type: 'series_episode',
+            itemId: String(previous.id),
+            accountId,
+            seriesId: currentSeriesId,
+            seasonNumber: previous.seasonNumber,
+            episodeNumber: previous.episodeNumber,
+        };
+        setCurrentSeriesPlayContext({ seriesData, currentEpisode: previous });
+        setPlayerStartTime(undefined);
+        setPlayerRealDuration(previous.durationSeconds ?? undefined);
+        needsTranscodeFlagRef.current = false;
+        setPlayerTitle(previous.title);
+        setPlayerUrl(sources[0]);
+        setPlayerSources(sources);
+    }, [token, accountId, currentSeriesPlayContext, resolvePlaybackSources, episodeProgressMap]);
+
     const handleOpenSeriesDetails = useCallback(
         async (item: ContentItem) => {
             if (!token || !accountId || !item.seriesId) return;
@@ -1100,7 +1187,8 @@ export default function App() {
             };
             setCurrentSeriesPlayContext(null);
             setPlayerStartTime(vodStartTimeSec);
-            setPlayerRealDuration(vodProg?.totalDuration && vodProg.totalDuration > 0 ? vodProg.totalDuration : undefined);
+            const providerDuration = item.durationSeconds && item.durationSeconds > 0 ? item.durationSeconds : undefined;
+            setPlayerRealDuration(providerDuration ?? (vodProg?.totalDuration && vodProg.totalDuration > 0 ? vodProg.totalDuration : undefined));
             needsTranscodeFlagRef.current = false;
             openPlayer(item.title, vodSources);
         },
@@ -1269,6 +1357,9 @@ export default function App() {
         setSelectedCategories((prev) => ({ ...prev, [activeSection]: categoryId }));
     };
 
+    const playerKeyboardEnabled =
+        playerOpen && !showIptvDialog && !seriesDetailOpen && !recordingsOpen && !scheduleOpen;
+
     if (!token) {
         return <LoginPage onLogin={handleLogin} onRegister={handleRegister} isLoading={isLoadingAuth} error={authError} />;
     }
@@ -1384,8 +1475,10 @@ export default function App() {
                         : undefined
                 }
                 onNextEpisode={handleNextEpisode}
+                onPreviousEpisode={handlePreviousEpisode}
                 realDuration={playerRealDuration}
                 onTranscodeFallback={handleTranscodeFallback}
+                keyboardEnabled={playerKeyboardEnabled}
                 onClose={() => {
                     setPlayerOpen(false);
                     setPlayerUrl(null);

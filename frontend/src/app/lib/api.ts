@@ -39,6 +39,8 @@ export interface ContentItem {
   seasonsCount?: number | null;
   episodesCount?: number | null;
   rating: string | null;
+  duration?: string | null;
+  durationSeconds?: number | null;
   containerExtension?: string | null;
   streamId: number | null;
   seriesId: number | null;
