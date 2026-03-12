@@ -78,9 +78,9 @@ The backend handles authentication, IPTV account security, data retrieval, and m
 
 > This roadmap lists the next planned improvements for the project.
 
-- [ ] Favorites (channels, movies, series, episodes).
+- [x] Favorites (channels, movies, series, episodes).
 - [ ] "TvParty" mode for synchronized multi-viewer watching.
-- [ x ] Docker images release
+- [x] Docker images release
 - [ ] Enriched context using the IMDB API.
 - [ ] Watch history and automatic resume.
 - [ ] Advanced filters (genre, year, rating, resolution).
