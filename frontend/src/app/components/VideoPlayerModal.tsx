@@ -13,6 +13,18 @@ function fmtTime(sec: number): string {
     return `${m}:${String(s).padStart(2, '0')}`;
 }
 
+function isHlsSource(url: string): boolean {
+    if (/\.m3u8(?:$|[?#])/i.test(url)) return true;
+
+    try {
+        const parsed = new URL(url, window.location.origin);
+        const ext = (parsed.searchParams.get('containerExtension') ?? parsed.searchParams.get('ext') ?? '').toLowerCase();
+        return ext === 'm3u8';
+    } catch {
+        return false;
+    }
+}
+
 interface VideoPlayerModalProps {
     open: boolean;
     title: string;
@@ -95,6 +107,7 @@ export function VideoPlayerModal({
     // currentTimeSec = videoElement.currentTime + seekOffset  (true position in the media)
     const [currentTimeSec, setCurrentTimeSec] = useState(0);
     const [effectiveDuration, setEffectiveDuration] = useState(0);
+    const effectiveDurationRef = useRef(0);
     const [bufferedEnd, setBufferedEnd] = useState(0);
     const [volume, setVolume] = useState(1);
     const [isMuted, setIsMuted] = useState(false);
@@ -129,11 +142,16 @@ export function VideoPlayerModal({
 
     // ── Reset when modal closes ──────────────────────────────────────────────
     useEffect(() => {
+        effectiveDurationRef.current = effectiveDuration;
+    }, [effectiveDuration]);
+
+    useEffect(() => {
         if (!open) {
             setAutoplayCountdown(null);
             setIsPlaying(false);
             setCurrentTimeSec(0);
             setEffectiveDuration(0);
+            effectiveDurationRef.current = 0;
             setBufferedEnd(0);
             setShowControls(true);
         }
@@ -205,7 +223,27 @@ export function VideoPlayerModal({
         seekOffsetRef.current = 0;
         setCurrentTimeSec(0);
         setEffectiveDuration(0);
+        effectiveDurationRef.current = 0;
         setBufferedEnd(0);
+
+        const resolveDuration = (): number => {
+            const nativeDuration =
+                Number.isFinite(videoElement.duration) && videoElement.duration > 0
+                    ? videoElement.duration
+                    : 0;
+            const realDurationValue = realDurationRef.current && realDurationRef.current > 0
+                ? realDurationRef.current
+                : 0;
+
+            if (isTranscodeModeRef.current) {
+                if (realDurationValue > 0) return realDurationValue;
+                if (effectiveDurationRef.current > 0) return effectiveDurationRef.current;
+                return nativeDuration;
+            }
+
+            if (nativeDuration > 0) return nativeDuration;
+            return effectiveDurationRef.current > 0 ? effectiveDurationRef.current : 0;
+        };
 
         const clearWatchdog = () => {
             if (watchdogTimer !== null) {
@@ -282,10 +320,13 @@ export function VideoPlayerModal({
                 onTranscodeFallbackRef.current?.();
                 // Update effective duration now that we know it's transcode
                 const rd = realDurationRef.current;
-                if (rd && rd > 0) setEffectiveDuration(rd);
+                if (rd && rd > 0) {
+                    effectiveDurationRef.current = rd;
+                    setEffectiveDuration(rd);
+                }
             }
 
-            if (url.endsWith('.m3u8') && Hls.isSupported()) {
+            if (isHlsSource(url) && Hls.isSupported()) {
                 hls = new Hls();
                 hls.loadSource(url);
                 hls.attachMedia(videoElement);
@@ -301,14 +342,11 @@ export function VideoPlayerModal({
         };
 
         const refreshDuration = () => {
-            const dur =
-                isTranscodeModeRef.current && realDurationRef.current && realDurationRef.current > 0
-                    ? realDurationRef.current
-                    : Number.isFinite(videoElement.duration) && videoElement.duration > 0
-                    ? videoElement.duration
-                    : 0;
-            // Keep last known valid duration to avoid UI regressions to 0 during metadata churn.
-            setEffectiveDuration((previous) => (dur > 0 ? dur : previous));
+            const dur = resolveDuration();
+            if (dur > 0 && Math.abs(dur - effectiveDurationRef.current) > 0.01) {
+                effectiveDurationRef.current = dur;
+                setEffectiveDuration(dur);
+            }
         };
 
         const handleError = () => tryNextSource();
@@ -349,16 +387,10 @@ export function VideoPlayerModal({
             if (now - progressThrottleRef.current < 5000) return;
             progressThrottleRef.current = now;
             if (effectiveCt <= 0) return;
-            const dur = isTranscodeModeRef.current
-                ? (
-                      (realDurationRef.current && realDurationRef.current > 0
-                          ? realDurationRef.current
-                          : Number.isFinite(videoElement.duration) && videoElement.duration > 0
-                          ? videoElement.duration
-                          : 0)
-                  )
-                : videoElement.duration;
-            cb(effectiveCt, Number.isFinite(dur) ? dur : 0);
+            const dur = resolveDuration();
+            // Never persist invalid duration values, they break resume and progress UI.
+            if (!Number.isFinite(dur) || dur <= 0) return;
+            cb(effectiveCt, dur);
         };
 
         const handlePlay = () => setIsPlaying(true);
@@ -366,10 +398,7 @@ export function VideoPlayerModal({
 
         const handleEnded = () => {
             setIsPlaying(false);
-            const realDur = realDurationRef.current;
-            const nativeDur = Number.isFinite(videoElement.duration) ? videoElement.duration : 0;
-            const dur =
-                isTranscodeModeRef.current && realDur && realDur > 0 ? realDur : nativeDur;
+            const dur = resolveDuration();
             const ct = dur > 0 ? dur : videoElement.currentTime + seekOffsetRef.current;
             onEndedRef.current?.(ct, dur);
             if (autoplayRef.current && nextEpisodeTitleRef.current && onNextEpisodeRef.current) {

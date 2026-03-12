@@ -121,9 +121,19 @@ function addSeekToTranscodeSources(sources: string[], seekSeconds?: number): str
     return sources.map((source) => {
         if (!source.includes('/api/iptv/transcode')) return source;
 
-        const url = new URL(source);
-        url.searchParams.set('seekSeconds', seekSeconds.toFixed(3));
-        return url.toString();
+        try {
+            const isAbsolute = /^https?:\/\//i.test(source);
+            const url = isAbsolute
+                ? new URL(source)
+                : new URL(source, window.location.origin);
+            url.searchParams.set('seekSeconds', seekSeconds.toFixed(3));
+
+            if (isAbsolute) return url.toString();
+            return `${url.pathname}${url.search}${url.hash}`;
+        } catch {
+            // Keep the original source instead of breaking playback.
+            return source;
+        }
     });
 }
 
@@ -1053,144 +1063,148 @@ export default function App() {
     const handlePlay = useCallback(
         async (item: ContentItem) => {
             if (!token || !accountId) return;
+            try {
+                if (activeSection === 'series') {
+                    if (!item.seriesId) {
+                        await handleOpenSeriesDetails(item);
+                        return;
+                    }
 
-            if (activeSection === 'series') {
-                if (!item.seriesId) {
-                    await handleOpenSeriesDetails(item);
-                    return;
-                }
+                    const progressKey = `${accountId}:${item.seriesId}`;
+                    const prog = seriesProgressMap[progressKey];
 
-                const progressKey = `${accountId}:${item.seriesId}`;
-                const prog = seriesProgressMap[progressKey];
+                    if (!prog?.lastEpisode) {
+                        // No progress yet -> open detail modal (default behaviour)
+                        await handleOpenSeriesDetails(item);
+                        return;
+                    }
 
-                if (!prog?.lastEpisode) {
-                    // No progress yet → open detail modal (default behaviour)
-                    await handleOpenSeriesDetails(item);
-                    return;
-                }
+                    const { lastEpisode } = prog;
+                    const remaining =
+                        lastEpisode.totalDuration > 0
+                            ? lastEpisode.totalDuration - lastEpisode.currentTime
+                            : Infinity;
 
-                const { lastEpisode } = prog;
-                const remaining =
-                    lastEpisode.totalDuration > 0
-                        ? lastEpisode.totalDuration - lastEpisode.currentTime
-                        : Infinity;
-
-                let seriesData: SeriesInfoResponse;
-                try {
-                    setSeriesDetailLoading(true);
-                    seriesData = await fetchSeriesInfo(token, accountId, item.seriesId);
-                } catch {
                     setSeriesDetailLoading(false);
-                    await handleOpenSeriesDetails(item);
-                    return;
-                }
-                setSeriesDetailLoading(false);
-
-                let targetEpisode: SeriesEpisode | null = null;
-                let startTimeSec: number | undefined = undefined;
-
-                if (lastEpisode.isWatched || remaining <= 10) {
-                    // Find and play next episode
-                    targetEpisode = findNextEpisode(
-                        seriesData,
-                        lastEpisode.seasonNumber ?? 1,
-                        lastEpisode.episodeNumber ?? 1
-                    );
-                    if (!targetEpisode) {
-                        // Series finished → open modal
+                    let seriesData: SeriesInfoResponse;
+                    try {
+                        setSeriesDetailLoading(true);
+                        seriesData = await fetchSeriesInfo(token, accountId, item.seriesId);
+                    } catch {
+                        setSeriesDetailLoading(false);
                         await handleOpenSeriesDetails(item);
                         return;
                     }
-                } else {
-                    // Resume the in-progress episode
-                    const episodeIdNum = Number(lastEpisode.episodeId);
-                    for (const episodes of Object.values(seriesData.episodesBySeason)) {
-                        const found = episodes.find((ep) => ep.id === episodeIdNum);
-                        if (found) {
-                            targetEpisode = found;
-                            break;
+                    setSeriesDetailLoading(false);
+
+                    let targetEpisode: SeriesEpisode | null = null;
+                    let startTimeSec: number | undefined = undefined;
+
+                    if (lastEpisode.isWatched || remaining <= 10) {
+                        // Find and play next episode
+                        targetEpisode = findNextEpisode(
+                            seriesData,
+                            lastEpisode.seasonNumber ?? 1,
+                            lastEpisode.episodeNumber ?? 1
+                        );
+                        if (!targetEpisode) {
+                            // Series finished -> open modal
+                            await handleOpenSeriesDetails(item);
+                            return;
                         }
+                    } else {
+                        // Resume the in-progress episode
+                        const episodeIdNum = Number(lastEpisode.episodeId);
+                        for (const episodes of Object.values(seriesData.episodesBySeason)) {
+                            const found = episodes.find((ep) => ep.id === episodeIdNum);
+                            if (found) {
+                                targetEpisode = found;
+                                break;
+                            }
+                        }
+                        if (!targetEpisode) {
+                            await handleOpenSeriesDetails(item);
+                            return;
+                        }
+                        startTimeSec = lastEpisode.currentTime > 0 ? lastEpisode.currentTime : undefined;
                     }
-                    if (!targetEpisode) {
-                        await handleOpenSeriesDetails(item);
-                        return;
-                    }
-                    startTimeSec = lastEpisode.currentTime > 0 ? lastEpisode.currentTime : undefined;
-                }
 
-                const rawSources = await resolvePlaybackSources(
-                    {
-                        id: String(targetEpisode.id),
-                        title: targetEpisode.title,
-                        categoryId: '',
-                        poster: targetEpisode.poster,
-                        description: null,
-                        genre: null,
-                        year: null,
-                        rating: targetEpisode.rating ? String(targetEpisode.rating) : null,
-                        containerExtension: targetEpisode.containerExtension,
-                        streamId: null,
-                        seriesId: targetEpisode.id,
-                    },
-                    'series',
-                    targetEpisode.id,
-                    {
-                        mediaTitle: targetEpisode.title,
-                        seriesTitle: seriesData.info.name,
+                    const rawSources = await resolvePlaybackSources(
+                        {
+                            id: String(targetEpisode.id),
+                            title: targetEpisode.title,
+                            categoryId: '',
+                            poster: targetEpisode.poster,
+                            description: null,
+                            genre: null,
+                            year: null,
+                            rating: targetEpisode.rating ? String(targetEpisode.rating) : null,
+                            containerExtension: targetEpisode.containerExtension,
+                            streamId: null,
+                            seriesId: targetEpisode.id,
+                        },
+                        'series',
+                        targetEpisode.id,
+                        {
+                            mediaTitle: targetEpisode.title,
+                            seriesTitle: seriesData.info.name,
+                            seasonNumber: targetEpisode.seasonNumber,
+                            episodeNumber: targetEpisode.episodeNumber,
+                        }
+                    );
+
+                    // If this episode previously needed transcode, skip straight to it.
+                    const epNeedsTranscode =
+                        lastEpisode.needsTranscode ||
+                        (episodeProgressMap[lastEpisode.episodeId]?.needsTranscode ?? false);
+                    const sources = epNeedsTranscode
+                        ? addSeekToTranscodeSources(reorderWithTranscodeFirst(rawSources), startTimeSec)
+                        : rawSources;
+
+                    currentlyPlayingRef.current = {
+                        type: 'series_episode',
+                        itemId: String(targetEpisode.id),
+                        accountId,
+                        seriesId: String(item.seriesId),
                         seasonNumber: targetEpisode.seasonNumber,
                         episodeNumber: targetEpisode.episodeNumber,
-                    }
-                );
+                    };
+                    setCurrentSeriesPlayContext({ seriesData, currentEpisode: targetEpisode });
+                    setPlayerStartTime(startTimeSec);
+                    setPlayerRealDuration(targetEpisode.durationSeconds ?? undefined);
+                    needsTranscodeFlagRef.current = false;
+                    openPlayer(targetEpisode.title, sources);
+                    return;
+                }
 
-                // If this episode previously needed transcode, skip straight to it
-                const epNeedsTranscode =
-                    lastEpisode.needsTranscode ||
-                    (episodeProgressMap[lastEpisode.episodeId]?.needsTranscode ?? false);
-                const sources = epNeedsTranscode
-                    ? addSeekToTranscodeSources(reorderWithTranscodeFirst(rawSources), startTimeSec)
-                    : rawSources;
+                const streamId = item.streamId;
+                if (!streamId) return;
 
+                const vodProg = vodProgressMap[`${accountId}:${item.id}`];
+                const vodStartTimeSec =
+                    vodProg && !vodProg.isWatched && vodProg.currentTime > 0
+                        ? vodProg.currentTime
+                        : undefined;
+                const rawVodSources = await resolvePlaybackSources(item, activeSection, streamId, {
+                    mediaTitle: item.title,
+                });
+                const vodSources = vodProg?.needsTranscode
+                    ? addSeekToTranscodeSources(reorderWithTranscodeFirst(rawVodSources), vodStartTimeSec)
+                    : rawVodSources;
                 currentlyPlayingRef.current = {
-                    type: 'series_episode',
-                    itemId: String(targetEpisode.id),
+                    type: 'vod',
+                    itemId: item.id,
                     accountId,
-                    seriesId: String(item.seriesId),
-                    seasonNumber: targetEpisode.seasonNumber,
-                    episodeNumber: targetEpisode.episodeNumber,
                 };
-                setCurrentSeriesPlayContext({ seriesData, currentEpisode: targetEpisode });
-                setPlayerStartTime(startTimeSec);
-                setPlayerRealDuration(targetEpisode.durationSeconds ?? undefined);
+                setCurrentSeriesPlayContext(null);
+                setPlayerStartTime(vodStartTimeSec);
+                const providerDuration = item.durationSeconds && item.durationSeconds > 0 ? item.durationSeconds : undefined;
+                setPlayerRealDuration(providerDuration ?? (vodProg?.totalDuration && vodProg.totalDuration > 0 ? vodProg.totalDuration : undefined));
                 needsTranscodeFlagRef.current = false;
-                openPlayer(targetEpisode.title, sources);
-                return;
+                openPlayer(item.title, vodSources);
+            } catch (error) {
+                console.error('Playback start failed', error);
             }
-
-            const streamId = item.streamId;
-            if (!streamId) return;
-
-            const vodProg = vodProgressMap[`${accountId}:${item.id}`];
-            const vodStartTimeSec =
-                vodProg && !vodProg.isWatched && vodProg.currentTime > 0
-                    ? vodProg.currentTime
-                    : undefined;
-            const rawVodSources = await resolvePlaybackSources(item, activeSection, streamId, {
-                mediaTitle: item.title,
-            });
-            const vodSources = vodProg?.needsTranscode
-                ? addSeekToTranscodeSources(reorderWithTranscodeFirst(rawVodSources), vodStartTimeSec)
-                : rawVodSources;
-            currentlyPlayingRef.current = {
-                type: 'vod',
-                itemId: item.id,
-                accountId,
-            };
-            setCurrentSeriesPlayContext(null);
-            setPlayerStartTime(vodStartTimeSec);
-            const providerDuration = item.durationSeconds && item.durationSeconds > 0 ? item.durationSeconds : undefined;
-            setPlayerRealDuration(providerDuration ?? (vodProg?.totalDuration && vodProg.totalDuration > 0 ? vodProg.totalDuration : undefined));
-            needsTranscodeFlagRef.current = false;
-            openPlayer(item.title, vodSources);
         },
         [token, accountId, activeSection, resolvePlaybackSources, handleOpenSeriesDetails, seriesProgressMap, episodeProgressMap, vodProgressMap]
     );
@@ -1199,57 +1213,61 @@ export default function App() {
         async (episode: SeriesEpisode) => {
             if (!token || !accountId) return;
 
-            // Resume from saved position if episode is in progress
-            const epProg = episodeProgressMap[String(episode.id)];
-            const startTimeSec =
-                epProg && !epProg.isWatched && epProg.currentTime > 0
-                    ? epProg.currentTime
-                    : undefined;
+            try {
+                // Resume from saved position if episode is in progress
+                const epProg = episodeProgressMap[String(episode.id)];
+                const startTimeSec =
+                    epProg && !epProg.isWatched && epProg.currentTime > 0
+                        ? epProg.currentTime
+                        : undefined;
 
-            const rawSources = await resolvePlaybackSources(
-                {
-                    id: String(episode.id),
-                    title: episode.title,
-                    categoryId: '',
-                    poster: episode.poster,
-                    description: null,
-                    genre: null,
-                    year: null,
-                    rating: episode.rating ? String(episode.rating) : null,
-                    containerExtension: episode.containerExtension,
-                    streamId: null,
-                    seriesId: episode.id,
-                },
-                'series',
-                episode.id,
-                {
-                    mediaTitle: episode.title,
-                    seriesTitle: seriesDetailData?.info.name ?? undefined,
+                const rawSources = await resolvePlaybackSources(
+                    {
+                        id: String(episode.id),
+                        title: episode.title,
+                        categoryId: '',
+                        poster: episode.poster,
+                        description: null,
+                        genre: null,
+                        year: null,
+                        rating: episode.rating ? String(episode.rating) : null,
+                        containerExtension: episode.containerExtension,
+                        streamId: null,
+                        seriesId: episode.id,
+                    },
+                    'series',
+                    episode.id,
+                    {
+                        mediaTitle: episode.title,
+                        seriesTitle: seriesDetailData?.info.name ?? undefined,
+                        seasonNumber: episode.seasonNumber,
+                        episodeNumber: episode.episodeNumber,
+                    }
+                );
+
+                const sources = epProg?.needsTranscode
+                    ? addSeekToTranscodeSources(reorderWithTranscodeFirst(rawSources), startTimeSec)
+                    : rawSources;
+
+                currentlyPlayingRef.current = {
+                    type: 'series_episode',
+                    itemId: String(episode.id),
+                    accountId,
+                    seriesId: seriesDetailItemId !== null ? String(seriesDetailItemId) : undefined,
                     seasonNumber: episode.seasonNumber,
                     episodeNumber: episode.episodeNumber,
-                }
-            );
-
-            const sources = epProg?.needsTranscode
-                ? addSeekToTranscodeSources(reorderWithTranscodeFirst(rawSources), startTimeSec)
-                : rawSources;
-
-            currentlyPlayingRef.current = {
-                type: 'series_episode',
-                itemId: String(episode.id),
-                accountId,
-                seriesId: seriesDetailItemId !== null ? String(seriesDetailItemId) : undefined,
-                seasonNumber: episode.seasonNumber,
-                episodeNumber: episode.episodeNumber,
-            };
-            setCurrentSeriesPlayContext(
-                seriesDetailData ? { seriesData: seriesDetailData, currentEpisode: episode } : null
-            );
-            setPlayerStartTime(startTimeSec);
-            setPlayerRealDuration(episode.durationSeconds ?? undefined);
-            needsTranscodeFlagRef.current = false;
-            setSeriesDetailOpen(false);
-            openPlayer(episode.title, sources);
+                };
+                setCurrentSeriesPlayContext(
+                    seriesDetailData ? { seriesData: seriesDetailData, currentEpisode: episode } : null
+                );
+                setPlayerStartTime(startTimeSec);
+                setPlayerRealDuration(episode.durationSeconds ?? undefined);
+                needsTranscodeFlagRef.current = false;
+                setSeriesDetailOpen(false);
+                openPlayer(episode.title, sources);
+            } catch (error) {
+                console.error('Episode playback start failed', error);
+            }
         },
         [token, accountId, resolvePlaybackSources, seriesDetailData, seriesDetailItemId, episodeProgressMap]
     );
