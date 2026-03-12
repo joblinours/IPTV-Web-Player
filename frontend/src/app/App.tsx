@@ -13,6 +13,7 @@ import { LiveScheduleDialog } from './components/LiveScheduleDialog';
 import {
     addIptvAccount,
     addFavorite,
+    clearWatchHistory,
     fetchCategories,
     fetchContentPage,
     fetchEpg,
@@ -939,6 +940,19 @@ export default function App() {
         needsTranscodeFlagRef.current = true;
     }, []);
 
+    const handleClearWatchHistory = useCallback(async () => {
+        if (!token || !accountId) return;
+        try {
+            await clearWatchHistory(token, accountId);
+            // Clear the progress maps
+            setVodProgressMap({});
+            setSeriesProgressMap({});
+        } catch (error) {
+            console.error('Failed to clear watch history:', error);
+            throw error;
+        }
+    }, [token, accountId]);
+
     const handleNextEpisode = useCallback(async () => {
         if (!token || !accountId || !currentSeriesPlayContext) return;
         const { seriesData, currentEpisode } = currentSeriesPlayContext;
@@ -1458,6 +1472,7 @@ export default function App() {
                         setPreferences(previous);
                     });
                 }}
+                onClearWatchHistory={handleClearWatchHistory}
             />
 
             <main className="relative">

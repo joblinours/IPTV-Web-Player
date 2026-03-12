@@ -18,6 +18,7 @@ interface HeaderProps {
   onAddAccount?: () => void;
   preferences?: UserPreferences;
   onUpdatePreferences?: (prefs: Partial<UserPreferences>) => void;
+  onClearWatchHistory?: () => void;
 }
 
 export function Header({
@@ -34,6 +35,7 @@ export function Header({
   onAddAccount,
   preferences,
   onUpdatePreferences,
+  onClearWatchHistory,
 }: HeaderProps) {
   const [searchOpen, setSearchOpen] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -272,6 +274,7 @@ export function Header({
         onAddAccount={onAddAccount}
         preferences={preferences}
         onUpdatePreferences={onUpdatePreferences}
+        onClearWatchHistory={onClearWatchHistory}
       />
     </>
   );

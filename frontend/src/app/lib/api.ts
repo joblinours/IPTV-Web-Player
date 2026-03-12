@@ -302,6 +302,7 @@ export function buildTranscodeUrl(params: {
   section: SectionType;
   streamId: number;
   containerExtension?: string;
+  durationSeconds?: number;
   debugContext?: PlaybackDebugContext;
 }) {
   const type = sectionToBackendType(params.section);
@@ -317,6 +318,7 @@ export function buildTranscodeUrl(params: {
   if (params.debugContext?.seriesTitle) query.set('seriesTitle', params.debugContext.seriesTitle);
   if (typeof params.debugContext?.seasonNumber === 'number') query.set('seasonNumber', String(params.debugContext.seasonNumber));
   if (typeof params.debugContext?.episodeNumber === 'number') query.set('episodeNumber', String(params.debugContext.episodeNumber));
+  if (typeof params.durationSeconds === 'number' && params.durationSeconds > 0) query.set('durationSeconds', String(Math.floor(params.durationSeconds)));
 
   return `${API_BASE_URL}/api/iptv/transcode?${query.toString()}`;
 }
@@ -427,6 +429,15 @@ export async function clearProgress(
   return request<{ ok: boolean }>(
     '/api/progress',
     { method: 'DELETE', body: JSON.stringify(params) },
+    token
+  );
+}
+
+export async function clearWatchHistory(token: string, accountId: number) {
+  const query = new URLSearchParams({ accountId: String(accountId) });
+  return request<{ ok: boolean }>(
+    `/api/progress/clear?${query.toString()}`,
+    { method: 'DELETE' },
     token
   );
 }

@@ -738,6 +738,33 @@ app.delete('/api/progress', { preHandler: [app.authenticate] }, async (request: 
   return { ok: true };
 });
 
+app.delete('/api/progress/clear', { preHandler: [app.authenticate] }, async (request: any, reply) => {
+  const querySchema = z.object({
+    accountId: z.coerce.number().int().positive(),
+  });
+
+  const parsed = querySchema.safeParse(request.query);
+  if (!parsed.success) {
+    return reply.code(400).send({ message: 'Invalid query' });
+  }
+
+  // Verify user owns this account
+  const account = db
+    .prepare('SELECT id FROM iptv_accounts WHERE id = ? AND user_id = ?')
+    .get(parsed.data.accountId, request.user.userId) as { id: number } | undefined;
+
+  if (!account) {
+    return reply.code(404).send({ message: 'Account not found' });
+  }
+
+  // Delete all watch progress for this account
+  db.prepare(
+    'DELETE FROM watch_progress WHERE user_id = ? AND account_id = ?'
+  ).run(request.user.userId, parsed.data.accountId);
+
+  return { ok: true };
+});
+
 // ── User Preferences ─────────────────────────────────────────────────────────
 
 app.get('/api/preferences', { preHandler: [app.authenticate] }, async (request: any) => {
@@ -1323,6 +1350,57 @@ app.get('/api/iptv/replay-url', { preHandler: [app.authenticate] }, async (reque
   return { url };
 });
 
+// Helper: Parse HTTP Range header (e.g., "bytes=1000-2000")
+function parseRangeHeader(rangeHeader: string | undefined, totalBytes: number): { start: number; end: number } | null {
+  if (!rangeHeader || !rangeHeader.startsWith('bytes=')) return null;
+
+  const rangePart = rangeHeader.slice(6); // Remove "bytes="
+  const parts = rangePart.split('-');
+
+  if (parts.length !== 2) return null;
+
+  const start = parts[0] ? parseInt(parts[0], 10) : 0;
+  const end = parts[1] ? parseInt(parts[1], 10) : totalBytes - 1;
+
+  if (isNaN(start) || isNaN(end) || start > end || start < 0 || end >= totalBytes) {
+    return null;
+  }
+
+  return { start, end };
+}
+
+// Helper: Get duration in seconds from an FFmpeg-accessible source
+async function getStreamDuration(sourceUrl: string): Promise<number | null> {
+  return new Promise((resolve) => {
+    const ffprobe = spawn('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1:noprint_names=1', sourceUrl]);
+
+    let output = '';
+    ffprobe.stdout.on('data', (chunk) => {
+      output += chunk.toString();
+    });
+
+    ffprobe.on('close', () => {
+      try {
+        const duration = parseFloat(output.trim());
+        resolve(isNaN(duration) ? null : duration);
+      } catch {
+        resolve(null);
+      }
+    });
+
+    ffprobe.on('error', () => {
+      resolve(null);
+    });
+
+    setTimeout(() => {
+      if (!ffprobe.killed) {
+        ffprobe.kill('SIGKILL');
+        resolve(null);
+      }
+    }, 5000); // 5 second timeout
+  });
+}
+
 app.get('/api/iptv/transcode', async (request: any, reply) => {
   const querySchema = z.object({
     token: z.string().min(10),
@@ -1330,6 +1408,7 @@ app.get('/api/iptv/transcode', async (request: any, reply) => {
     type: z.enum(['live', 'vod', 'series']),
     streamId: z.coerce.number().int().positive(),
     seekSeconds: z.coerce.number().min(0).optional(),
+    durationSeconds: z.coerce.number().min(1).optional(),
     containerExtension: z.string().min(2).max(8).optional().default('mkv'),
     mediaTitle: z.string().max(180).optional(),
     seriesTitle: z.string().max(180).optional(),
@@ -1367,10 +1446,61 @@ app.get('/api/iptv/transcode', async (request: any, reply) => {
   const password = decryptSecret(account.password_enc);
   const pathType = parsed.data.type === 'live' ? 'live' : parsed.data.type === 'vod' ? 'movie' : 'series';
   const sourceUrl = `${normalizeServerUrl(account.server_url)}/${pathType}/${account.username}/${password}/${parsed.data.streamId}.${parsed.data.containerExtension}`;
-  const seekSeconds =
-    typeof parsed.data.seekSeconds === 'number' && Number.isFinite(parsed.data.seekSeconds)
-      ? Math.max(0, parsed.data.seekSeconds)
-      : 0;
+  
+  // Handle Range requests for seeking in transcoded video
+  let seekSeconds = typeof parsed.data.seekSeconds === 'number' && Number.isFinite(parsed.data.seekSeconds)
+    ? Math.max(0, parsed.data.seekSeconds)
+    : 0;
+
+  let isRangeRequest = false;
+  let contentRangeHeader: string | undefined;
+  let responseStatusCode = 200;
+
+  const rangeHeader = request.headers.range;
+  if (rangeHeader && typeof rangeHeader === 'string') {
+    // Try to use provided duration or fetch it
+    let durationSeconds: number | null | undefined = parsed.data.durationSeconds;
+    
+    if (!durationSeconds) {
+      // Fallback: try to fetch duration using ffprobe (with timeout)
+      durationSeconds = await getStreamDuration(sourceUrl);
+    }
+
+    if (durationSeconds && durationSeconds > 0) {
+      // Estimate file size: assuming ~1 Mbps for MP4 transcode
+      const estimatedBitrate = 1_000_000; // 1 Mbps in bytes per second
+      const estimatedTotalBytes = Math.floor(durationSeconds * estimatedBitrate / 8);
+
+      const range = parseRangeHeader(rangeHeader, estimatedTotalBytes);
+      if (range) {
+        isRangeRequest = true;
+        responseStatusCode = 206;
+
+        // Map byte range to time range
+        const bytesPerSecond = estimatedTotalBytes / durationSeconds;
+        const startSeconds = Math.floor(range.start / bytesPerSecond);
+        const endSeconds = Math.floor(range.end / bytesPerSecond);
+        const rangeSeconds = Math.max(1, endSeconds - startSeconds);
+
+        seekSeconds = startSeconds;
+        contentRangeHeader = `bytes ${range.start}-${range.end}/${estimatedTotalBytes}`;
+
+        logPlaybackTrace({
+          route: 'transcode',
+          mode: 'transcode',
+          accountId: parsed.data.accountId,
+          mediaType: parsed.data.type,
+          streamId: parsed.data.streamId,
+          extension: parsed.data.containerExtension,
+          mediaTitle: parsed.data.mediaTitle,
+          seriesTitle: parsed.data.seriesTitle,
+          seasonNumber: parsed.data.seasonNumber,
+          episodeNumber: parsed.data.episodeNumber,
+          note: `range_request_${range.start}-${range.end}_seek_${startSeconds}-${endSeconds}s`,
+        });
+      }
+    }
+  }
 
   const ffmpegArgs = [
     '-hide_banner',
@@ -1486,9 +1616,13 @@ app.get('/api/iptv/transcode', async (request: any, reply) => {
   });
 
   reply.hijack();
-  reply.raw.statusCode = 200;
+  reply.raw.statusCode = responseStatusCode;
   reply.raw.setHeader('Content-Type', 'video/mp4');
+  reply.raw.setHeader('Accept-Ranges', 'bytes');
   reply.raw.setHeader('Cache-Control', 'no-store');
+  if (contentRangeHeader) {
+    reply.raw.setHeader('Content-Range', contentRangeHeader);
+  }
   ffmpeg.stdout.pipe(reply.raw);
 });
 
