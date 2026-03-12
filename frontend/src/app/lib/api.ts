@@ -351,6 +351,7 @@ export interface ProgressEntry {
   currentTime: number;
   totalDuration: number;
   isWatched: boolean;
+  needsTranscode: boolean;
   updatedAt: number;
 }
 
@@ -362,6 +363,7 @@ export interface SeriesProgressSummary {
     currentTime: number;
     totalDuration: number;
     isWatched: boolean;
+    needsTranscode: boolean;
   } | null;
   watchedEpisodeIds: string[];
 }
@@ -406,6 +408,7 @@ export async function updateProgress(
     currentTime: number;
     totalDuration: number;
     isWatched?: boolean;
+    needsTranscode?: boolean;
   }
 ) {
   return request<{ ok: boolean }>(

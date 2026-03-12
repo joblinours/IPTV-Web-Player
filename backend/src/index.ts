@@ -228,6 +228,7 @@ function initDb() {
       current_time REAL NOT NULL DEFAULT 0,
       total_duration REAL NOT NULL DEFAULT 0,
       is_watched INTEGER NOT NULL DEFAULT 0,
+      needs_transcode INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL,
       FOREIGN KEY(user_id) REFERENCES users(id),
       FOREIGN KEY(account_id) REFERENCES iptv_accounts(id),
@@ -251,6 +252,11 @@ function initDb() {
 }
 
 initDb();
+
+// Migration: add needs_transcode column if it doesn't exist yet (safe on fresh DB too)
+try {
+  db.exec(`ALTER TABLE watch_progress ADD COLUMN needs_transcode INTEGER NOT NULL DEFAULT 0`);
+} catch { /* column already exists */ }
 
 const registerSchema = z.object({
   email: z.string().email(),
@@ -533,6 +539,7 @@ app.post('/api/progress', { preHandler: [app.authenticate] }, async (request: an
     currentTime: z.coerce.number().min(0),
     totalDuration: z.coerce.number().min(0),
     isWatched: z.boolean().optional(),
+    needsTranscode: z.boolean().optional(),
   });
 
   const parsed = bodySchema.safeParse(request.body);
@@ -552,14 +559,16 @@ app.post('/api/progress', { preHandler: [app.authenticate] }, async (request: an
     parsed.data.totalDuration > 0 ? parsed.data.totalDuration - parsed.data.currentTime : Infinity;
   const autoWatched = parsed.data.totalDuration > 0 && remaining <= 10 ? 1 : 0;
   const isWatched = parsed.data.isWatched === true ? 1 : autoWatched;
+  const needsTranscode = parsed.data.needsTranscode === true ? 1 : 0;
 
   db.prepare(`
-    INSERT INTO watch_progress(user_id, account_id, type, item_id, series_id, season_number, episode_number, current_time, total_duration, is_watched, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO watch_progress(user_id, account_id, type, item_id, series_id, season_number, episode_number, current_time, total_duration, is_watched, needs_transcode, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(user_id, account_id, type, item_id) DO UPDATE SET
       current_time = excluded.current_time,
       total_duration = excluded.total_duration,
       is_watched = MAX(watch_progress.is_watched, excluded.is_watched),
+      needs_transcode = MAX(watch_progress.needs_transcode, excluded.needs_transcode),
       series_id = COALESCE(excluded.series_id, watch_progress.series_id),
       season_number = COALESCE(excluded.season_number, watch_progress.season_number),
       episode_number = COALESCE(excluded.episode_number, watch_progress.episode_number),
@@ -575,6 +584,7 @@ app.post('/api/progress', { preHandler: [app.authenticate] }, async (request: an
     parsed.data.currentTime,
     parsed.data.totalDuration,
     isWatched,
+    needsTranscode,
     nowEpoch()
   );
 
@@ -612,7 +622,7 @@ app.get('/api/progress', { preHandler: [app.authenticate] }, async (request: any
   const placeholders = itemIds.map(() => '?').join(',');
   const rows = db
     .prepare(
-      `SELECT item_id, current_time, total_duration, is_watched, updated_at
+      `SELECT item_id, current_time, total_duration, is_watched, needs_transcode, updated_at
        FROM watch_progress
        WHERE user_id = ? AND account_id = ? AND type = ? AND item_id IN (${placeholders})`
     )
@@ -621,6 +631,7 @@ app.get('/api/progress', { preHandler: [app.authenticate] }, async (request: any
       current_time: number;
       total_duration: number;
       is_watched: number;
+      needs_transcode: number;
       updated_at: number;
     }>;
 
@@ -630,6 +641,7 @@ app.get('/api/progress', { preHandler: [app.authenticate] }, async (request: any
       currentTime: row.current_time,
       totalDuration: row.total_duration,
       isWatched: row.is_watched === 1,
+      needsTranscode: row.needs_transcode === 1,
       updatedAt: row.updated_at,
     })),
   };
@@ -656,7 +668,7 @@ app.get('/api/progress/series', { preHandler: [app.authenticate] }, async (reque
 
   const rows = db
     .prepare(
-      `SELECT item_id, current_time, total_duration, is_watched, season_number, episode_number, updated_at
+      `SELECT item_id, current_time, total_duration, is_watched, needs_transcode, season_number, episode_number, updated_at
        FROM watch_progress
        WHERE user_id = ? AND account_id = ? AND series_id = ?
        ORDER BY updated_at DESC`
@@ -666,6 +678,7 @@ app.get('/api/progress/series', { preHandler: [app.authenticate] }, async (reque
       current_time: number;
       total_duration: number;
       is_watched: number;
+      needs_transcode: number;
       season_number: number | null;
       episode_number: number | null;
       updated_at: number;
@@ -686,6 +699,7 @@ app.get('/api/progress/series', { preHandler: [app.authenticate] }, async (reque
       currentTime: lastRow.current_time,
       totalDuration: lastRow.total_duration,
       isWatched: lastRow.is_watched === 1,
+      needsTranscode: lastRow.needs_transcode === 1,
     },
     watchedEpisodeIds,
   };

@@ -4,6 +4,14 @@ import { X, SkipForward } from 'lucide-react';
 
 const AUTOPLAY_COUNTDOWN_START = 5;
 
+function formatDuration(seconds: number): string {
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.floor(seconds % 60);
+    if (h > 0) return `${h}h${String(m).padStart(2, '0')}`;
+    return `${m}m${String(s).padStart(2, '0')}`;
+}
+
 interface VideoPlayerModalProps {
     open: boolean;
     title: string;
@@ -22,6 +30,10 @@ interface VideoPlayerModalProps {
     nextEpisodeTitle?: string;
     /** Called when the autoplay countdown reaches zero */
     onNextEpisode?: () => void;
+    /** Real total duration (seconds) of the media, used when transcoding hides the true length */
+    realDuration?: number;
+    /** Called once when the player switches to the ffmpeg transcode fallback source */
+    onTranscodeFallback?: () => void;
 }
 
 export function VideoPlayerModal({
@@ -36,6 +48,8 @@ export function VideoPlayerModal({
     autoplay = false,
     nextEpisodeTitle,
     onNextEpisode,
+    realDuration,
+    onTranscodeFallback,
 }: VideoPlayerModalProps) {
     const videoRef = useRef<HTMLVideoElement>(null);
     const allSources = streamSources.length > 0 ? streamSources : streamUrl ? [streamUrl] : [];
@@ -53,8 +67,15 @@ export function VideoPlayerModal({
     nextEpisodeTitleRef.current = nextEpisodeTitle;
     const onNextEpisodeRef = useRef(onNextEpisode);
     onNextEpisodeRef.current = onNextEpisode;
+    const realDurationRef = useRef(realDuration);
+    realDurationRef.current = realDuration;
+    const onTranscodeFallbackRef = useRef(onTranscodeFallback);
+    onTranscodeFallbackRef.current = onTranscodeFallback;
 
     const progressThrottleRef = useRef<number>(0);
+    // Tracks whether the active source is the ffmpeg transcode fallback
+    const isTranscodeModeRef = useRef(false);
+    const [isTranscodeMode, setIsTranscodeMode] = useState(false);
     const [autoplayCountdown, setAutoplayCountdown] = useState<number | null>(null);
 
     // Countdown timer
@@ -74,7 +95,10 @@ export function VideoPlayerModal({
 
     // Reset countdown when player closes
     useEffect(() => {
-        if (!open) setAutoplayCountdown(null);
+        if (!open) {
+            setAutoplayCountdown(null);
+            setIsTranscodeMode(false);
+        }
     }, [open]);
 
     useEffect(() => {
@@ -86,6 +110,10 @@ export function VideoPlayerModal({
         let watchdogTimer: number | null = null;
         let switchedByWatchdog = false;
         let didSeek = false;
+
+        // Reset transcode mode for this new playback session
+        isTranscodeModeRef.current = false;
+        setIsTranscodeMode(false);
 
         const clearWatchdog = () => {
             if (watchdogTimer !== null) {
@@ -158,6 +186,13 @@ export function VideoPlayerModal({
             videoElement.removeAttribute('src');
             videoElement.load();
 
+            // Detect switch to ffmpeg transcode fallback
+            if (url.includes('/api/iptv/transcode') && !isTranscodeModeRef.current) {
+                isTranscodeModeRef.current = true;
+                setIsTranscodeMode(true);
+                onTranscodeFallbackRef.current?.();
+            }
+
             if (url.endsWith('.m3u8') && Hls.isSupported()) {
                 hls = new Hls();
                 hls.loadSource(url);
@@ -196,14 +231,24 @@ export function VideoPlayerModal({
             if (now - progressThrottleRef.current < 5000) return;
             progressThrottleRef.current = now;
             const ct = videoElement.currentTime;
-            const dur = videoElement.duration;
-            if (ct > 0 && dur > 0 && Number.isFinite(dur)) {
-                cb(ct, dur);
+            if (ct <= 0) return;
+            // When transcoding, videoElement.duration only reflects the transcoded portion.
+            // Use realDuration if provided, otherwise pass 0 so the backend never
+            // auto-marks the item as watched based on an unreliable duration.
+            const isTranscode = isTranscodeModeRef.current;
+            const dur = isTranscode
+                ? (realDurationRef.current ?? 0)
+                : videoElement.duration;
+            if (Number.isFinite(ct)) {
+                cb(ct, Number.isFinite(dur) ? dur : 0);
             }
         };
 
         const handleEnded = () => {
-            const dur = Number.isFinite(videoElement.duration) ? videoElement.duration : 0;
+            const isTranscode = isTranscodeModeRef.current;
+            const realDur = realDurationRef.current;
+            const nativeDur = Number.isFinite(videoElement.duration) ? videoElement.duration : 0;
+            const dur = isTranscode && realDur && realDur > 0 ? realDur : nativeDur;
             const ct = dur > 0 ? dur : videoElement.currentTime;
             onEndedRef.current?.(ct, dur);
 
@@ -246,6 +291,13 @@ export function VideoPlayerModal({
                 </div>
                 <div className="aspect-video bg-black relative">
                     <video ref={videoRef} controls className="w-full h-full" playsInline />
+
+                    {/* Real duration badge shown when in transcode mode */}
+                    {isTranscodeMode && realDuration && realDuration > 0 && (
+                        <div className="absolute top-3 left-3 pointer-events-none bg-black/75 backdrop-blur-sm border border-orange-500/40 text-orange-400 text-xs px-2.5 py-1 rounded-md">
+                            Durée totale : {formatDuration(realDuration)}
+                        </div>
+                    )}
 
                     {/* Autoplay countdown overlay */}
                     {autoplayCountdown !== null && (

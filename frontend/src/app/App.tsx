@@ -50,7 +50,7 @@ type SeriesStatsMap = Record<number, { seasonsCount: number; episodesCount: numb
 type FavoriteIdMap = Record<SectionType, Set<string>>;
 type VodProgressMap = Record<string, ProgressEntry>;
 type SeriesProgressMap = Record<string, SeriesProgressSummary>;
-type EpisodeProgressMap = Record<string, { currentTime: number; totalDuration: number; isWatched: boolean }>;
+type EpisodeProgressMap = Record<string, { currentTime: number; totalDuration: number; isWatched: boolean; needsTranscode: boolean }>;
 
 type CurrentlyPlayingMeta = {
     type: 'vod' | 'series_episode';
@@ -83,6 +83,12 @@ function findNextEpisode(
         }
     }
     return null;
+}
+
+function reorderWithTranscodeFirst(sources: string[]): string[] {
+    const idx = sources.findIndex((s) => s.includes('/api/iptv/transcode'));
+    if (idx <= 0) return sources;
+    return [sources[idx], ...sources.filter((_, i) => i !== idx)];
 }
 
 const PAGE_SIZE = 50;
@@ -183,12 +189,15 @@ export default function App() {
     const [seriesProgressMap, setSeriesProgressMap] = useState<SeriesProgressMap>({});
     const [episodeProgressMap, setEpisodeProgressMap] = useState<EpisodeProgressMap>({});
     const [playerStartTime, setPlayerStartTime] = useState<number | undefined>(undefined);
+    const [playerRealDuration, setPlayerRealDuration] = useState<number | undefined>(undefined);
     const [seriesDetailItemId, setSeriesDetailItemId] = useState<number | null>(null);
     const [currentSeriesPlayContext, setCurrentSeriesPlayContext] = useState<{
         seriesData: SeriesInfoResponse;
         currentEpisode: SeriesEpisode;
     } | null>(null);
     const currentlyPlayingRef = useRef<CurrentlyPlayingMeta | null>(null);
+    // Set to true when the player falls back to ffmpeg transcode; piggybacked onto next updateProgress call
+    const needsTranscodeFlagRef = useRef(false);
 
     const currentCategory = selectedCategories[activeSection];
     const featuredItem = useMemo(() => items[0] ?? null, [items]);
@@ -556,6 +565,8 @@ export default function App() {
         setEpisodeProgressMap({});
         setCurrentSeriesPlayContext(null);
         setPlayerStartTime(undefined);
+        setPlayerRealDuration(undefined);
+        needsTranscodeFlagRef.current = false;
         currentlyPlayingRef.current = null;
     };
 
@@ -584,6 +595,8 @@ export default function App() {
         setEpisodeProgressMap({});
         setCurrentSeriesPlayContext(null);
         setPlayerStartTime(undefined);
+        setPlayerRealDuration(undefined);
+        needsTranscodeFlagRef.current = false;
         currentlyPlayingRef.current = null;
     };
 
@@ -711,6 +724,8 @@ export default function App() {
             const ctx = currentlyPlayingRef.current;
             if (!ctx) return;
 
+            const needsTranscode = needsTranscodeFlagRef.current || undefined;
+
             updateProgress(token, {
                 accountId: ctx.accountId,
                 type: ctx.type,
@@ -720,6 +735,7 @@ export default function App() {
                 episodeNumber: ctx.episodeNumber,
                 currentTime,
                 totalDuration: duration,
+                needsTranscode,
             }).catch(() => {});
 
             const isWatched = duration > 0 && duration - currentTime <= 10;
@@ -732,13 +748,14 @@ export default function App() {
                         currentTime,
                         totalDuration: duration,
                         isWatched,
+                        needsTranscode: needsTranscode ?? false,
                         updatedAt: Math.floor(Date.now() / 1000),
                     },
                 }));
             } else if (ctx.type === 'series_episode' && ctx.seriesId) {
                 setEpisodeProgressMap((prev) => ({
                     ...prev,
-                    [ctx.itemId]: { currentTime, totalDuration: duration, isWatched },
+                    [ctx.itemId]: { currentTime, totalDuration: duration, isWatched, needsTranscode: needsTranscode ?? false },
                 }));
                 setSeriesProgressMap((prev) => {
                     const key = `${accountId}:${ctx.seriesId}`;
@@ -753,6 +770,7 @@ export default function App() {
                                 currentTime,
                                 totalDuration: duration,
                                 isWatched,
+                                needsTranscode: needsTranscode ?? false,
                             },
                             watchedEpisodeIds: existing?.watchedEpisodeIds ?? [],
                         },
@@ -769,6 +787,8 @@ export default function App() {
             const ctx = currentlyPlayingRef.current;
             if (!ctx) return;
 
+            const needsTranscode = needsTranscodeFlagRef.current || undefined;
+
             updateProgress(token, {
                 accountId: ctx.accountId,
                 type: ctx.type,
@@ -779,6 +799,7 @@ export default function App() {
                 currentTime,
                 totalDuration: duration,
                 isWatched: true,
+                needsTranscode,
             }).catch(() => {});
 
             if (ctx.type === 'vod') {
@@ -789,13 +810,14 @@ export default function App() {
                         currentTime,
                         totalDuration: duration,
                         isWatched: true,
+                        needsTranscode: needsTranscode ?? false,
                         updatedAt: Math.floor(Date.now() / 1000),
                     },
                 }));
             } else if (ctx.type === 'series_episode' && ctx.seriesId) {
                 setEpisodeProgressMap((prev) => ({
                     ...prev,
-                    [ctx.itemId]: { currentTime, totalDuration: duration, isWatched: true },
+                    [ctx.itemId]: { currentTime, totalDuration: duration, isWatched: true, needsTranscode: needsTranscode ?? false },
                 }));
                 setSeriesProgressMap((prev) => {
                     const key = `${accountId}:${ctx.seriesId}`;
@@ -812,6 +834,7 @@ export default function App() {
                                 currentTime,
                                 totalDuration: duration,
                                 isWatched: true,
+                                needsTranscode: needsTranscode ?? false,
                             },
                             watchedEpisodeIds: [...newWatched],
                         },
@@ -822,6 +845,10 @@ export default function App() {
         [token, accountId]
     );
 
+    const handleTranscodeFallback = useCallback(() => {
+        needsTranscodeFlagRef.current = true;
+    }, []);
+
     const handleNextEpisode = useCallback(async () => {
         if (!token || !accountId || !currentSeriesPlayContext) return;
         const { seriesData, currentEpisode } = currentSeriesPlayContext;
@@ -830,7 +857,7 @@ export default function App() {
         const next = findNextEpisode(seriesData, currentEpisode.seasonNumber, currentEpisode.episodeNumber);
         if (!next) return;
 
-        const sources = await resolvePlaybackSources(
+        const rawSources = await resolvePlaybackSources(
             {
                 id: String(next.id),
                 title: next.title,
@@ -854,7 +881,10 @@ export default function App() {
             }
         );
 
-        if (sources.length === 0) return;
+        if (rawSources.length === 0) return;
+
+        const nextEpProg = episodeProgressMap[String(next.id)];
+        const sources = nextEpProg?.needsTranscode ? reorderWithTranscodeFirst(rawSources) : rawSources;
 
         currentlyPlayingRef.current = {
             type: 'series_episode',
@@ -866,10 +896,12 @@ export default function App() {
         };
         setCurrentSeriesPlayContext({ seriesData, currentEpisode: next });
         setPlayerStartTime(undefined);
+        setPlayerRealDuration(next.durationSeconds ?? undefined);
+        needsTranscodeFlagRef.current = false;
         setPlayerTitle(next.title);
         setPlayerUrl(sources[0]);
         setPlayerSources(sources);
-    }, [token, accountId, currentSeriesPlayContext, resolvePlaybackSources]);
+    }, [token, accountId, currentSeriesPlayContext, resolvePlaybackSources, episodeProgressMap]);
 
     const handleOpenSeriesDetails = useCallback(
         async (item: ContentItem) => {
@@ -903,6 +935,7 @@ export default function App() {
                                     currentTime: entry.currentTime,
                                     totalDuration: entry.totalDuration,
                                     isWatched: entry.isWatched,
+                                    needsTranscode: entry.needsTranscode,
                                 };
                             }
                             setEpisodeProgressMap(map);
@@ -986,7 +1019,7 @@ export default function App() {
                     startTimeSec = lastEpisode.currentTime > 0 ? lastEpisode.currentTime : undefined;
                 }
 
-                const sources = await resolvePlaybackSources(
+                const rawSources = await resolvePlaybackSources(
                     {
                         id: String(targetEpisode.id),
                         title: targetEpisode.title,
@@ -1010,6 +1043,12 @@ export default function App() {
                     }
                 );
 
+                // If this episode previously needed transcode, skip straight to it
+                const epNeedsTranscode =
+                    lastEpisode.needsTranscode ||
+                    (episodeProgressMap[lastEpisode.episodeId]?.needsTranscode ?? false);
+                const sources = epNeedsTranscode ? reorderWithTranscodeFirst(rawSources) : rawSources;
+
                 currentlyPlayingRef.current = {
                     type: 'series_episode',
                     itemId: String(targetEpisode.id),
@@ -1020,6 +1059,8 @@ export default function App() {
                 };
                 setCurrentSeriesPlayContext({ seriesData, currentEpisode: targetEpisode });
                 setPlayerStartTime(startTimeSec);
+                setPlayerRealDuration(targetEpisode.durationSeconds ?? undefined);
+                needsTranscodeFlagRef.current = false;
                 openPlayer(targetEpisode.title, sources);
                 return;
             }
@@ -1027,9 +1068,11 @@ export default function App() {
             const streamId = item.streamId;
             if (!streamId) return;
 
-            const sources = await resolvePlaybackSources(item, activeSection, streamId, {
+            const vodProg = vodProgressMap[`${accountId}:${item.id}`];
+            const rawVodSources = await resolvePlaybackSources(item, activeSection, streamId, {
                 mediaTitle: item.title,
             });
+            const vodSources = vodProg?.needsTranscode ? reorderWithTranscodeFirst(rawVodSources) : rawVodSources;
             currentlyPlayingRef.current = {
                 type: 'vod',
                 itemId: item.id,
@@ -1037,9 +1080,11 @@ export default function App() {
             };
             setCurrentSeriesPlayContext(null);
             setPlayerStartTime(undefined);
-            openPlayer(item.title, sources);
+            setPlayerRealDuration(undefined);
+            needsTranscodeFlagRef.current = false;
+            openPlayer(item.title, vodSources);
         },
-        [token, accountId, activeSection, resolvePlaybackSources, handleOpenSeriesDetails, seriesProgressMap]
+        [token, accountId, activeSection, resolvePlaybackSources, handleOpenSeriesDetails, seriesProgressMap, episodeProgressMap, vodProgressMap]
     );
 
     const handlePlayEpisode = useCallback(
@@ -1053,7 +1098,7 @@ export default function App() {
                     ? epProg.currentTime
                     : undefined;
 
-            const sources = await resolvePlaybackSources(
+            const rawSources = await resolvePlaybackSources(
                 {
                     id: String(episode.id),
                     title: episode.title,
@@ -1077,6 +1122,8 @@ export default function App() {
                 }
             );
 
+            const sources = epProg?.needsTranscode ? reorderWithTranscodeFirst(rawSources) : rawSources;
+
             currentlyPlayingRef.current = {
                 type: 'series_episode',
                 itemId: String(episode.id),
@@ -1089,6 +1136,8 @@ export default function App() {
                 seriesDetailData ? { seriesData: seriesDetailData, currentEpisode: episode } : null
             );
             setPlayerStartTime(startTimeSec);
+            setPlayerRealDuration(episode.durationSeconds ?? undefined);
+            needsTranscodeFlagRef.current = false;
             setSeriesDetailOpen(false);
             openPlayer(episode.title, sources);
         },
@@ -1313,11 +1362,15 @@ export default function App() {
                         : undefined
                 }
                 onNextEpisode={handleNextEpisode}
+                realDuration={playerRealDuration}
+                onTranscodeFallback={handleTranscodeFallback}
                 onClose={() => {
                     setPlayerOpen(false);
                     setPlayerUrl(null);
                     setPlayerSources([]);
                     setPlayerStartTime(undefined);
+                    setPlayerRealDuration(undefined);
+                    needsTranscodeFlagRef.current = false;
                     currentlyPlayingRef.current = null;
                 }}
             />
