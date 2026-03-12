@@ -4,14 +4,6 @@ import { X, SkipForward } from 'lucide-react';
 
 const AUTOPLAY_COUNTDOWN_START = 5;
 
-function formatDuration(seconds: number): string {
-    const h = Math.floor(seconds / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    const s = Math.floor(seconds % 60);
-    if (h > 0) return `${h}h${String(m).padStart(2, '0')}`;
-    return `${m}m${String(s).padStart(2, '0')}`;
-}
-
 interface VideoPlayerModalProps {
     open: boolean;
     title: string;
@@ -71,12 +63,34 @@ export function VideoPlayerModal({
     realDurationRef.current = realDuration;
     const onTranscodeFallbackRef = useRef(onTranscodeFallback);
     onTranscodeFallbackRef.current = onTranscodeFallback;
+    const activeSourceUrlRef = useRef<string | null>(null);
 
     const progressThrottleRef = useRef<number>(0);
     // Tracks whether the active source is the ffmpeg transcode fallback
     const isTranscodeModeRef = useRef(false);
-    const [isTranscodeMode, setIsTranscodeMode] = useState(false);
     const [autoplayCountdown, setAutoplayCountdown] = useState<number | null>(null);
+
+    const syncNativeDurationDisplay = (videoElement: HTMLVideoElement) => {
+        try {
+            delete (videoElement as HTMLVideoElement & { duration?: number }).duration;
+        } catch {
+            // noop
+        }
+
+        if (!isTranscodeModeRef.current || !realDurationRef.current || realDurationRef.current <= 0) {
+            return;
+        }
+
+        try {
+            Object.defineProperty(videoElement, 'duration', {
+                configurable: true,
+                get: () => realDurationRef.current ?? 0,
+            });
+            videoElement.dispatchEvent(new Event('durationchange'));
+        } catch {
+            // Some browsers do not allow overriding the instance getter.
+        }
+    };
 
     // Countdown timer
     useEffect(() => {
@@ -97,7 +111,6 @@ export function VideoPlayerModal({
     useEffect(() => {
         if (!open) {
             setAutoplayCountdown(null);
-            setIsTranscodeMode(false);
         }
     }, [open]);
 
@@ -113,7 +126,7 @@ export function VideoPlayerModal({
 
         // Reset transcode mode for this new playback session
         isTranscodeModeRef.current = false;
-        setIsTranscodeMode(false);
+        activeSourceUrlRef.current = null;
 
         const clearWatchdog = () => {
             if (watchdogTimer !== null) {
@@ -182,6 +195,7 @@ export function VideoPlayerModal({
 
             clearWatchdog();
             didSeek = false;
+            activeSourceUrlRef.current = url;
             videoElement.pause();
             videoElement.removeAttribute('src');
             videoElement.load();
@@ -189,9 +203,10 @@ export function VideoPlayerModal({
             // Detect switch to ffmpeg transcode fallback
             if (url.includes('/api/iptv/transcode') && !isTranscodeModeRef.current) {
                 isTranscodeModeRef.current = true;
-                setIsTranscodeMode(true);
                 onTranscodeFallbackRef.current?.();
             }
+
+            syncNativeDurationDisplay(videoElement);
 
             if (url.endsWith('.m3u8') && Hls.isSupported()) {
                 hls = new Hls();
@@ -215,9 +230,15 @@ export function VideoPlayerModal({
         };
 
         const handleCanPlay = () => {
+            syncNativeDurationDisplay(videoElement);
+
             if (!didSeek) {
                 const st = startTimeRef.current;
-                if (st && st > 0) {
+                const activeUrl = activeSourceUrlRef.current;
+                const hasBackendSeek =
+                    !!activeUrl && activeUrl.includes('/api/iptv/transcode') && activeUrl.includes('seekSeconds=');
+
+                if (st && st > 0 && !hasBackendSeek) {
                     didSeek = true;
                     videoElement.currentTime = st;
                 }
@@ -272,6 +293,11 @@ export function VideoPlayerModal({
             videoElement.pause();
             videoElement.removeAttribute('src');
             videoElement.load();
+            try {
+                delete (videoElement as HTMLVideoElement & { duration?: number }).duration;
+            } catch {
+                // noop
+            }
             if (hls) {
                 hls.destroy();
             }
@@ -291,13 +317,6 @@ export function VideoPlayerModal({
                 </div>
                 <div className="aspect-video bg-black relative">
                     <video ref={videoRef} controls className="w-full h-full" playsInline />
-
-                    {/* Real duration badge shown when in transcode mode */}
-                    {isTranscodeMode && realDuration && realDuration > 0 && (
-                        <div className="absolute top-3 left-3 pointer-events-none bg-black/75 backdrop-blur-sm border border-orange-500/40 text-orange-400 text-xs px-2.5 py-1 rounded-md">
-                            Durée totale : {formatDuration(realDuration)}
-                        </div>
-                    )}
 
                     {/* Autoplay countdown overlay */}
                     {autoplayCountdown !== null && (

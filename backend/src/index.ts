@@ -1274,6 +1274,7 @@ app.get('/api/iptv/transcode', async (request: any, reply) => {
     accountId: z.coerce.number().int().positive(),
     type: z.enum(['live', 'vod', 'series']),
     streamId: z.coerce.number().int().positive(),
+    seekSeconds: z.coerce.number().min(0).optional(),
     containerExtension: z.string().min(2).max(8).optional().default('mkv'),
     mediaTitle: z.string().max(180).optional(),
     seriesTitle: z.string().max(180).optional(),
@@ -1311,6 +1312,10 @@ app.get('/api/iptv/transcode', async (request: any, reply) => {
   const password = decryptSecret(account.password_enc);
   const pathType = parsed.data.type === 'live' ? 'live' : parsed.data.type === 'vod' ? 'movie' : 'series';
   const sourceUrl = `${normalizeServerUrl(account.server_url)}/${pathType}/${account.username}/${password}/${parsed.data.streamId}.${parsed.data.containerExtension}`;
+  const seekSeconds =
+    typeof parsed.data.seekSeconds === 'number' && Number.isFinite(parsed.data.seekSeconds)
+      ? Math.max(0, parsed.data.seekSeconds)
+      : 0;
 
   const ffmpegArgs = [
     '-hide_banner',
@@ -1318,6 +1323,13 @@ app.get('/api/iptv/transcode', async (request: any, reply) => {
     'error',
     '-fflags',
     '+genpts',
+  ];
+
+  if (seekSeconds > 0) {
+    ffmpegArgs.push('-ss', seekSeconds.toFixed(3));
+  }
+
+  ffmpegArgs.push(
     '-i',
     sourceUrl,
     '-map',
@@ -1343,7 +1355,7 @@ app.get('/api/iptv/transcode', async (request: any, reply) => {
     '-f',
     'mp4',
     'pipe:1',
-  ];
+  );
 
   const ffmpeg = spawn('ffmpeg', ffmpegArgs, {
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -1360,7 +1372,7 @@ app.get('/api/iptv/transcode', async (request: any, reply) => {
     seriesTitle: parsed.data.seriesTitle,
     seasonNumber: parsed.data.seasonNumber,
     episodeNumber: parsed.data.episodeNumber,
-    note: 'ffmpeg_start',
+    note: seekSeconds > 0 ? `ffmpeg_start_seek_${seekSeconds.toFixed(3)}` : 'ffmpeg_start',
   });
 
   let started = false;

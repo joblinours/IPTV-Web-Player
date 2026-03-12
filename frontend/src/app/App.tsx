@@ -91,6 +91,18 @@ function reorderWithTranscodeFirst(sources: string[]): string[] {
     return [sources[idx], ...sources.filter((_, i) => i !== idx)];
 }
 
+function addSeekToTranscodeSources(sources: string[], seekSeconds?: number): string[] {
+    if (!seekSeconds || seekSeconds <= 0) return sources;
+
+    return sources.map((source) => {
+        if (!source.includes('/api/iptv/transcode')) return source;
+
+        const url = new URL(source);
+        url.searchParams.set('seekSeconds', seekSeconds.toFixed(3));
+        return url.toString();
+    });
+}
+
 const PAGE_SIZE = 50;
 
 const defaultCategories: CategoryMap = {
@@ -1047,7 +1059,9 @@ export default function App() {
                 const epNeedsTranscode =
                     lastEpisode.needsTranscode ||
                     (episodeProgressMap[lastEpisode.episodeId]?.needsTranscode ?? false);
-                const sources = epNeedsTranscode ? reorderWithTranscodeFirst(rawSources) : rawSources;
+                const sources = epNeedsTranscode
+                    ? addSeekToTranscodeSources(reorderWithTranscodeFirst(rawSources), startTimeSec)
+                    : rawSources;
 
                 currentlyPlayingRef.current = {
                     type: 'series_episode',
@@ -1069,18 +1083,24 @@ export default function App() {
             if (!streamId) return;
 
             const vodProg = vodProgressMap[`${accountId}:${item.id}`];
+            const vodStartTimeSec =
+                vodProg && !vodProg.isWatched && vodProg.currentTime > 0
+                    ? vodProg.currentTime
+                    : undefined;
             const rawVodSources = await resolvePlaybackSources(item, activeSection, streamId, {
                 mediaTitle: item.title,
             });
-            const vodSources = vodProg?.needsTranscode ? reorderWithTranscodeFirst(rawVodSources) : rawVodSources;
+            const vodSources = vodProg?.needsTranscode
+                ? addSeekToTranscodeSources(reorderWithTranscodeFirst(rawVodSources), vodStartTimeSec)
+                : rawVodSources;
             currentlyPlayingRef.current = {
                 type: 'vod',
                 itemId: item.id,
                 accountId,
             };
             setCurrentSeriesPlayContext(null);
-            setPlayerStartTime(undefined);
-            setPlayerRealDuration(undefined);
+            setPlayerStartTime(vodStartTimeSec);
+            setPlayerRealDuration(vodProg?.totalDuration && vodProg.totalDuration > 0 ? vodProg.totalDuration : undefined);
             needsTranscodeFlagRef.current = false;
             openPlayer(item.title, vodSources);
         },
@@ -1122,7 +1142,9 @@ export default function App() {
                 }
             );
 
-            const sources = epProg?.needsTranscode ? reorderWithTranscodeFirst(rawSources) : rawSources;
+            const sources = epProg?.needsTranscode
+                ? addSeekToTranscodeSources(reorderWithTranscodeFirst(rawSources), startTimeSec)
+                : rawSources;
 
             currentlyPlayingRef.current = {
                 type: 'series_episode',
