@@ -54,7 +54,8 @@ export function SettingsDialog({
     const activeAccount = accounts.find(acc => acc.id === activeAccountId);
 
     return (
-        <Dialog open={open} onOpenChange={onOpenChange}>
+        <>
+            <Dialog open={open} onOpenChange={onOpenChange}>
             <DialogContent className="bg-gray-900/95 backdrop-blur-xl border border-white/10 text-white max-w-2xl max-h-[85vh] overflow-y-auto">
                 <DialogHeader>
                     <DialogTitle className="text-2xl font-bold bg-gradient-to-r from-red-500 to-orange-500 bg-clip-text text-transparent">
@@ -219,5 +220,6 @@ export function SettingsDialog({
                 </div>
             </AlertDialogContent>
         </AlertDialog>
+        </>
     );
 }
