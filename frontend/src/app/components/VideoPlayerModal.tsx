@@ -66,7 +66,7 @@ export function VideoPlayerModal({
             return;
         }
         const timer = window.setTimeout(
-            () => setAutoplayCountdown((prev) => (prev !== null ? prev - 1 : null)),
+            () => setAutoplayCountdown((prev: number | null) => (prev !== null ? prev - 1 : null)),
             1000
         );
         return () => window.clearTimeout(timer);
@@ -162,7 +162,7 @@ export function VideoPlayerModal({
                 hls = new Hls();
                 hls.loadSource(url);
                 hls.attachMedia(videoElement);
-                hls.on(Hls.Events.ERROR, (_event, data) => {
+                hls.on(Hls.Events.ERROR, (_event: string, data: { fatal: boolean }) => {
                     if (data.fatal) {
                         tryNextSource();
                     }

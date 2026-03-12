@@ -825,6 +825,7 @@ export default function App() {
     const handleNextEpisode = useCallback(async () => {
         if (!token || !accountId || !currentSeriesPlayContext) return;
         const { seriesData, currentEpisode } = currentSeriesPlayContext;
+        const currentSeriesId = currentlyPlayingRef.current?.seriesId;
 
         const next = findNextEpisode(seriesData, currentEpisode.seasonNumber, currentEpisode.episodeNumber);
         if (!next) return;
@@ -859,7 +860,7 @@ export default function App() {
             type: 'series_episode',
             itemId: String(next.id),
             accountId,
-            seriesId: String(seriesData.info.name), // use series name as fallback key
+            seriesId: currentSeriesId,
             seasonNumber: next.seasonNumber,
             episodeNumber: next.episodeNumber,
         };
@@ -1223,10 +1224,11 @@ export default function App() {
                 preferences={preferences}
                 onUpdatePreferences={(prefs) => {
                     if (!token) return;
+                    const previous = preferences;
                     setPreferences((prev) => ({ ...prev, ...prefs }));
                     updatePreferences(token, prefs).catch(() => {
                         // rollback on error
-                        setPreferences((prev) => ({ ...prev }));
+                        setPreferences(previous);
                     });
                 }}
             />
