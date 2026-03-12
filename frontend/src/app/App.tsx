@@ -704,7 +704,9 @@ export default function App() {
             const normalizedContainer = (item.containerExtension ?? '').toLowerCase();
             const base =
                 section === 'live'
-                    ? ['m3u8', 'ts']
+                    // Prefer TS first for better compatibility with proxied live streams,
+                    // then try m3u8 and the provider-declared extension.
+                    ? ['ts', 'm3u8', normalizedContainer || 'ts']
                     : [normalizedContainer || 'mp4', 'mp4', 'ts', 'm3u8'];
 
             const candidates = uniqueExtensions(base);

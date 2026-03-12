@@ -213,6 +213,7 @@ export function VideoPlayerModal({
 
         const videoElement = videoRef.current;
         let hls: Hls | null = null;
+        let hlsRecoverAttempted = false;
         let sourceIndex = 0;
         let watchdogTimer: number | null = null;
         let switchedByWatchdog = false;
@@ -277,7 +278,7 @@ export function VideoPlayerModal({
 
                 const videoDecoded = Number((videoElement as any).webkitDecodedFrameCount ?? -1);
                 const audioDecoded = Number((videoElement as any).webkitAudioDecodedByteCount ?? -1);
-                const noPicture = videoElement.videoWidth === 0 || videoDecoded === 0;
+                const noPicture = videoDecoded === 0 && audioDecoded === 0;
                 const noAudio = !videoElement.muted && audioDecoded === 0;
 
                 if (noPicture || noAudio) {
@@ -327,11 +328,24 @@ export function VideoPlayerModal({
             }
 
             if (isHlsSource(url) && Hls.isSupported()) {
-                hls = new Hls();
+                hlsRecoverAttempted = false;
+                hls = new Hls({
+                    enableWorker: true,
+                    lowLatencyMode: true,
+                    backBufferLength: 30,
+                });
                 hls.loadSource(url);
                 hls.attachMedia(videoElement);
-                hls.on(Hls.Events.ERROR, (_: string, data: { fatal: boolean }) => {
-                    if (data.fatal) tryNextSource();
+                hls.on(Hls.Events.ERROR, (_: string, data: { fatal: boolean; type?: string }) => {
+                    if (!data.fatal) return;
+
+                    if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !hlsRecoverAttempted) {
+                        hlsRecoverAttempted = true;
+                        hls?.recoverMediaError();
+                        return;
+                    }
+
+                    tryNextSource();
                 });
             } else {
                 videoElement.src = url;
