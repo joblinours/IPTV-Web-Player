@@ -17,8 +17,11 @@ import {
     fetchContentPage,
     fetchEpg,
     fetchFavorites,
-    fetchReplayUrl,
+    fetchProgress,
     fetchSeriesInfo,
+    fetchSeriesProgress,
+    fetchPreferences,
+    fetchReplayUrl,
     fetchStreamUrl,
     buildStreamProxyUrl,
     buildTranscodeUrl,
@@ -26,12 +29,17 @@ import {
     login,
     register,
     removeFavorite,
+    updateProgress,
+    updatePreferences,
     type CategoryItem,
     type ContentItem,
     type EpgItem,
     type IptvAccount,
+    type ProgressEntry,
     type SeriesEpisode,
     type SeriesInfoResponse,
+    type SeriesProgressSummary,
+    type UserPreferences,
     type PlaybackDebugContext,
     type SectionType,
 } from './lib/api';
@@ -40,6 +48,42 @@ type CategoryMap = Record<SectionType, CategoryItem[]>;
 type SelectedCategoryMap = Record<SectionType, string>;
 type SeriesStatsMap = Record<number, { seasonsCount: number; episodesCount: number }>;
 type FavoriteIdMap = Record<SectionType, Set<string>>;
+type VodProgressMap = Record<string, ProgressEntry>;
+type SeriesProgressMap = Record<string, SeriesProgressSummary>;
+type EpisodeProgressMap = Record<string, { currentTime: number; totalDuration: number; isWatched: boolean }>;
+
+type CurrentlyPlayingMeta = {
+    type: 'vod' | 'series_episode';
+    itemId: string;
+    accountId: number;
+    seriesId?: string;
+    seasonNumber?: number;
+    episodeNumber?: number;
+};
+
+function findNextEpisode(
+    seriesData: SeriesInfoResponse,
+    seasonNumber: number,
+    episodeNumber: number
+): SeriesEpisode | null {
+    const seasonKey = String(seasonNumber);
+    const currentSeasonEps = seriesData.episodesBySeason[seasonKey] ?? [];
+    const currentIdx = currentSeasonEps.findIndex((ep) => ep.episodeNumber === episodeNumber);
+    if (currentIdx >= 0 && currentIdx < currentSeasonEps.length - 1) {
+        return currentSeasonEps[currentIdx + 1];
+    }
+
+    // Try next seasons in order
+    const orderedSeasons = seriesData.seasons.map((s) => s.seasonNumber).sort((a, b) => a - b);
+    const currentSeasonIdx = orderedSeasons.indexOf(seasonNumber);
+    if (currentSeasonIdx >= 0) {
+        for (let i = currentSeasonIdx + 1; i < orderedSeasons.length; i++) {
+            const nextEps = seriesData.episodesBySeason[String(orderedSeasons[i])] ?? [];
+            if (nextEps.length > 0) return nextEps[0];
+        }
+    }
+    return null;
+}
 
 const PAGE_SIZE = 50;
 
@@ -132,6 +176,19 @@ export default function App() {
     const [scheduleTitle, setScheduleTitle] = useState('');
     const [scheduleLoading, setScheduleLoading] = useState(false);
     const [scheduleItems, setScheduleItems] = useState<EpgItem[]>([]);
+
+    // ── Watch progress & preferences ─────────────────────────────────────────
+    const [preferences, setPreferences] = useState<UserPreferences>({ autoplay: true, language: 'fr' });
+    const [vodProgressMap, setVodProgressMap] = useState<VodProgressMap>({});
+    const [seriesProgressMap, setSeriesProgressMap] = useState<SeriesProgressMap>({});
+    const [episodeProgressMap, setEpisodeProgressMap] = useState<EpisodeProgressMap>({});
+    const [playerStartTime, setPlayerStartTime] = useState<number | undefined>(undefined);
+    const [seriesDetailItemId, setSeriesDetailItemId] = useState<number | null>(null);
+    const [currentSeriesPlayContext, setCurrentSeriesPlayContext] = useState<{
+        seriesData: SeriesInfoResponse;
+        currentEpisode: SeriesEpisode;
+    } | null>(null);
+    const currentlyPlayingRef = useRef<CurrentlyPlayingMeta | null>(null);
 
     const currentCategory = selectedCategories[activeSection];
     const featuredItem = useMemo(() => items[0] ?? null, [items]);
@@ -294,8 +351,16 @@ export default function App() {
         };
     }, [token, accountId, activeSection, currentCategory, searchQuery]);
 
+    // Load user preferences when authenticated
     useEffect(() => {
-        if (!token || !accountId || activeSection !== 'series' || items.length === 0) return;
+        if (!token) return;
+        fetchPreferences(token)
+            .then((prefs) => setPreferences(prefs))
+            .catch(() => {});
+    }, [token]);
+
+    // Prefetch series stats (seasons/episodes count)
+    useEffect(() => {
 
         const targets = items
             .filter((item) => !!item.seriesId && !seriesStatsMap[item.seriesId])
@@ -331,6 +396,58 @@ export default function App() {
             cancelled = true;
         };
     }, [token, accountId, activeSection, items, seriesStatsMap]);
+
+    // Prefetch series progress summaries (for smart play button on tiles)
+    useEffect(() => {
+        if (!token || !accountId || activeSection !== 'series' || items.length === 0) return;
+
+        const targets = items.filter((item) => !!item.seriesId).slice(0, 8);
+        if (targets.length === 0) return;
+
+        let cancelled = false;
+
+        const load = async () => {
+            for (const target of targets) {
+                if (cancelled || !target.seriesId) break;
+                try {
+                    const prog = await fetchSeriesProgress(token, accountId, String(target.seriesId));
+                    if (cancelled) break;
+                    setSeriesProgressMap((prev) => ({
+                        ...prev,
+                        [`${accountId}:${target.seriesId}`]: prog,
+                    }));
+                } catch {
+                    // ignore
+                }
+            }
+        };
+
+        load();
+        return () => { cancelled = true; };
+    }, [token, accountId, activeSection, items]);
+
+    // Prefetch VOD progress for current page
+    useEffect(() => {
+        if (!token || !accountId || activeSection !== 'films' || items.length === 0) return;
+
+        const itemIds = items.slice(0, 50).map((item) => item.id).filter(Boolean);
+        if (itemIds.length === 0) return;
+
+        let cancelled = false;
+
+        fetchProgress(token, accountId, 'vod', itemIds)
+            .then((result) => {
+                if (cancelled) return;
+                const map: VodProgressMap = {};
+                for (const entry of result.items) {
+                    map[`${accountId}:${entry.itemId}`] = entry;
+                }
+                setVodProgressMap((prev) => ({ ...prev, ...map }));
+            })
+            .catch(() => {});
+
+        return () => { cancelled = true; };
+    }, [token, accountId, activeSection, items]);
 
     const handleLoadMore = useCallback(async () => {
         if (!token || !accountId || isLoadingContent || !hasMore) {
@@ -434,6 +551,12 @@ export default function App() {
         setScheduleOpen(false);
         setSeriesDetailOpen(false);
         setFavoritesBySection(createDefaultFavoriteMap());
+        setVodProgressMap({});
+        setSeriesProgressMap({});
+        setEpisodeProgressMap({});
+        setCurrentSeriesPlayContext(null);
+        setPlayerStartTime(undefined);
+        currentlyPlayingRef.current = null;
     };
 
     const handleLogout = () => {
@@ -455,6 +578,13 @@ export default function App() {
         setRecordingsOpen(false);
         setScheduleOpen(false);
         setFavoritesBySection(createDefaultFavoriteMap());
+        setPreferences({ autoplay: true, language: 'fr' });
+        setVodProgressMap({});
+        setSeriesProgressMap({});
+        setEpisodeProgressMap({});
+        setCurrentSeriesPlayContext(null);
+        setPlayerStartTime(undefined);
+        currentlyPlayingRef.current = null;
     };
 
     const handleToggleFavorite = useCallback(
@@ -575,12 +705,178 @@ export default function App() {
         setPlayerOpen(true);
     };
 
+    const handlePlayerProgress = useCallback(
+        (currentTime: number, duration: number) => {
+            if (!token || !accountId) return;
+            const ctx = currentlyPlayingRef.current;
+            if (!ctx) return;
+
+            updateProgress(token, {
+                accountId: ctx.accountId,
+                type: ctx.type,
+                itemId: ctx.itemId,
+                seriesId: ctx.seriesId,
+                seasonNumber: ctx.seasonNumber,
+                episodeNumber: ctx.episodeNumber,
+                currentTime,
+                totalDuration: duration,
+            }).catch(() => {});
+
+            const isWatched = duration > 0 && duration - currentTime <= 10;
+
+            if (ctx.type === 'vod') {
+                setVodProgressMap((prev) => ({
+                    ...prev,
+                    [`${accountId}:${ctx.itemId}`]: {
+                        itemId: ctx.itemId,
+                        currentTime,
+                        totalDuration: duration,
+                        isWatched,
+                        updatedAt: Math.floor(Date.now() / 1000),
+                    },
+                }));
+            } else if (ctx.type === 'series_episode' && ctx.seriesId) {
+                setEpisodeProgressMap((prev) => ({
+                    ...prev,
+                    [ctx.itemId]: { currentTime, totalDuration: duration, isWatched },
+                }));
+                setSeriesProgressMap((prev) => {
+                    const key = `${accountId}:${ctx.seriesId}`;
+                    const existing = prev[key];
+                    return {
+                        ...prev,
+                        [key]: {
+                            lastEpisode: {
+                                episodeId: ctx.itemId,
+                                seasonNumber: ctx.seasonNumber ?? null,
+                                episodeNumber: ctx.episodeNumber ?? null,
+                                currentTime,
+                                totalDuration: duration,
+                                isWatched,
+                            },
+                            watchedEpisodeIds: existing?.watchedEpisodeIds ?? [],
+                        },
+                    };
+                });
+            }
+        },
+        [token, accountId]
+    );
+
+    const handlePlayerEnded = useCallback(
+        (currentTime: number, duration: number) => {
+            if (!token || !accountId) return;
+            const ctx = currentlyPlayingRef.current;
+            if (!ctx) return;
+
+            updateProgress(token, {
+                accountId: ctx.accountId,
+                type: ctx.type,
+                itemId: ctx.itemId,
+                seriesId: ctx.seriesId,
+                seasonNumber: ctx.seasonNumber,
+                episodeNumber: ctx.episodeNumber,
+                currentTime,
+                totalDuration: duration,
+                isWatched: true,
+            }).catch(() => {});
+
+            if (ctx.type === 'vod') {
+                setVodProgressMap((prev) => ({
+                    ...prev,
+                    [`${accountId}:${ctx.itemId}`]: {
+                        itemId: ctx.itemId,
+                        currentTime,
+                        totalDuration: duration,
+                        isWatched: true,
+                        updatedAt: Math.floor(Date.now() / 1000),
+                    },
+                }));
+            } else if (ctx.type === 'series_episode' && ctx.seriesId) {
+                setEpisodeProgressMap((prev) => ({
+                    ...prev,
+                    [ctx.itemId]: { currentTime, totalDuration: duration, isWatched: true },
+                }));
+                setSeriesProgressMap((prev) => {
+                    const key = `${accountId}:${ctx.seriesId}`;
+                    const existing = prev[key];
+                    const newWatched = new Set(existing?.watchedEpisodeIds ?? []);
+                    newWatched.add(ctx.itemId);
+                    return {
+                        ...prev,
+                        [key]: {
+                            lastEpisode: {
+                                episodeId: ctx.itemId,
+                                seasonNumber: ctx.seasonNumber ?? null,
+                                episodeNumber: ctx.episodeNumber ?? null,
+                                currentTime,
+                                totalDuration: duration,
+                                isWatched: true,
+                            },
+                            watchedEpisodeIds: [...newWatched],
+                        },
+                    };
+                });
+            }
+        },
+        [token, accountId]
+    );
+
+    const handleNextEpisode = useCallback(async () => {
+        if (!token || !accountId || !currentSeriesPlayContext) return;
+        const { seriesData, currentEpisode } = currentSeriesPlayContext;
+
+        const next = findNextEpisode(seriesData, currentEpisode.seasonNumber, currentEpisode.episodeNumber);
+        if (!next) return;
+
+        const sources = await resolvePlaybackSources(
+            {
+                id: String(next.id),
+                title: next.title,
+                categoryId: '',
+                poster: next.poster,
+                description: null,
+                genre: null,
+                year: null,
+                rating: next.rating ? String(next.rating) : null,
+                containerExtension: next.containerExtension,
+                streamId: null,
+                seriesId: next.id,
+            },
+            'series',
+            next.id,
+            {
+                mediaTitle: next.title,
+                seriesTitle: seriesData.info.name,
+                seasonNumber: next.seasonNumber,
+                episodeNumber: next.episodeNumber,
+            }
+        );
+
+        if (sources.length === 0) return;
+
+        currentlyPlayingRef.current = {
+            type: 'series_episode',
+            itemId: String(next.id),
+            accountId,
+            seriesId: String(seriesData.info.name), // use series name as fallback key
+            seasonNumber: next.seasonNumber,
+            episodeNumber: next.episodeNumber,
+        };
+        setCurrentSeriesPlayContext({ seriesData, currentEpisode: next });
+        setPlayerStartTime(undefined);
+        setPlayerTitle(next.title);
+        setPlayerUrl(sources[0]);
+        setPlayerSources(sources);
+    }, [token, accountId, currentSeriesPlayContext, resolvePlaybackSources]);
+
     const handleOpenSeriesDetails = useCallback(
         async (item: ContentItem) => {
             if (!token || !accountId || !item.seriesId) return;
 
             setSeriesDetailLoading(true);
             setSeriesDetailOpen(true);
+            setSeriesDetailItemId(item.seriesId);
 
             try {
                 const data = await fetchSeriesInfo(token, accountId, item.seriesId);
@@ -592,6 +888,26 @@ export default function App() {
                     ...prev,
                     [item.seriesId as number]: { seasonsCount, episodesCount },
                 }));
+
+                // Load episode-level progress for the series detail modal
+                const allEpisodeIds = Object.values(data.episodesBySeason)
+                    .flat()
+                    .map((ep) => String(ep.id));
+                if (allEpisodeIds.length > 0) {
+                    fetchProgress(token, accountId, 'series_episode', allEpisodeIds)
+                        .then((result) => {
+                            const map: EpisodeProgressMap = {};
+                            for (const entry of result.items) {
+                                map[entry.itemId] = {
+                                    currentTime: entry.currentTime,
+                                    totalDuration: entry.totalDuration,
+                                    isWatched: entry.isWatched,
+                                };
+                            }
+                            setEpisodeProgressMap(map);
+                        })
+                        .catch(() => {});
+                }
             } catch {
                 setSeriesDetailData(null);
             } finally {
@@ -606,7 +922,104 @@ export default function App() {
             if (!token || !accountId) return;
 
             if (activeSection === 'series') {
-                await handleOpenSeriesDetails(item);
+                if (!item.seriesId) {
+                    await handleOpenSeriesDetails(item);
+                    return;
+                }
+
+                const progressKey = `${accountId}:${item.seriesId}`;
+                const prog = seriesProgressMap[progressKey];
+
+                if (!prog?.lastEpisode) {
+                    // No progress yet → open detail modal (default behaviour)
+                    await handleOpenSeriesDetails(item);
+                    return;
+                }
+
+                const { lastEpisode } = prog;
+                const remaining =
+                    lastEpisode.totalDuration > 0
+                        ? lastEpisode.totalDuration - lastEpisode.currentTime
+                        : Infinity;
+
+                let seriesData: SeriesInfoResponse;
+                try {
+                    setSeriesDetailLoading(true);
+                    seriesData = await fetchSeriesInfo(token, accountId, item.seriesId);
+                } catch {
+                    setSeriesDetailLoading(false);
+                    await handleOpenSeriesDetails(item);
+                    return;
+                }
+                setSeriesDetailLoading(false);
+
+                let targetEpisode: SeriesEpisode | null = null;
+                let startTimeSec: number | undefined = undefined;
+
+                if (lastEpisode.isWatched || remaining <= 10) {
+                    // Find and play next episode
+                    targetEpisode = findNextEpisode(
+                        seriesData,
+                        lastEpisode.seasonNumber ?? 1,
+                        lastEpisode.episodeNumber ?? 1
+                    );
+                    if (!targetEpisode) {
+                        // Series finished → open modal
+                        await handleOpenSeriesDetails(item);
+                        return;
+                    }
+                } else {
+                    // Resume the in-progress episode
+                    const episodeIdNum = Number(lastEpisode.episodeId);
+                    for (const episodes of Object.values(seriesData.episodesBySeason)) {
+                        const found = episodes.find((ep) => ep.id === episodeIdNum);
+                        if (found) {
+                            targetEpisode = found;
+                            break;
+                        }
+                    }
+                    if (!targetEpisode) {
+                        await handleOpenSeriesDetails(item);
+                        return;
+                    }
+                    startTimeSec = lastEpisode.currentTime > 0 ? lastEpisode.currentTime : undefined;
+                }
+
+                const sources = await resolvePlaybackSources(
+                    {
+                        id: String(targetEpisode.id),
+                        title: targetEpisode.title,
+                        categoryId: '',
+                        poster: targetEpisode.poster,
+                        description: null,
+                        genre: null,
+                        year: null,
+                        rating: targetEpisode.rating ? String(targetEpisode.rating) : null,
+                        containerExtension: targetEpisode.containerExtension,
+                        streamId: null,
+                        seriesId: targetEpisode.id,
+                    },
+                    'series',
+                    targetEpisode.id,
+                    {
+                        mediaTitle: targetEpisode.title,
+                        seriesTitle: seriesData.info.name,
+                        seasonNumber: targetEpisode.seasonNumber,
+                        episodeNumber: targetEpisode.episodeNumber,
+                    }
+                );
+
+                currentlyPlayingRef.current = {
+                    type: 'series_episode',
+                    itemId: String(targetEpisode.id),
+                    accountId,
+                    seriesId: String(item.seriesId),
+                    seasonNumber: targetEpisode.seasonNumber,
+                    episodeNumber: targetEpisode.episodeNumber,
+                };
+                setCurrentSeriesPlayContext({ seriesData, currentEpisode: targetEpisode });
+                setPlayerStartTime(startTimeSec);
+                openPlayer(targetEpisode.title, sources);
                 return;
             }
 
@@ -616,14 +1029,28 @@ export default function App() {
             const sources = await resolvePlaybackSources(item, activeSection, streamId, {
                 mediaTitle: item.title,
             });
+            currentlyPlayingRef.current = {
+                type: 'vod',
+                itemId: item.id,
+                accountId,
+            };
+            setCurrentSeriesPlayContext(null);
+            setPlayerStartTime(undefined);
             openPlayer(item.title, sources);
         },
-        [token, accountId, activeSection, resolvePlaybackSources, handleOpenSeriesDetails]
+        [token, accountId, activeSection, resolvePlaybackSources, handleOpenSeriesDetails, seriesProgressMap]
     );
 
     const handlePlayEpisode = useCallback(
         async (episode: SeriesEpisode) => {
             if (!token || !accountId) return;
+
+            // Resume from saved position if episode is in progress
+            const epProg = episodeProgressMap[String(episode.id)];
+            const startTimeSec =
+                epProg && !epProg.isWatched && epProg.currentTime > 0
+                    ? epProg.currentTime
+                    : undefined;
 
             const sources = await resolvePlaybackSources(
                 {
@@ -649,10 +1076,22 @@ export default function App() {
                 }
             );
 
+            currentlyPlayingRef.current = {
+                type: 'series_episode',
+                itemId: String(episode.id),
+                accountId,
+                seriesId: seriesDetailItemId !== null ? String(seriesDetailItemId) : undefined,
+                seasonNumber: episode.seasonNumber,
+                episodeNumber: episode.episodeNumber,
+            };
+            setCurrentSeriesPlayContext(
+                seriesDetailData ? { seriesData: seriesDetailData, currentEpisode: episode } : null
+            );
+            setPlayerStartTime(startTimeSec);
             setSeriesDetailOpen(false);
             openPlayer(episode.title, sources);
         },
-        [token, accountId, resolvePlaybackSources, seriesDetailData]
+        [token, accountId, resolvePlaybackSources, seriesDetailData, seriesDetailItemId, episodeProgressMap]
     );
 
     const handleOpenRecordings = useCallback(
@@ -781,6 +1220,15 @@ export default function App() {
                 activeAccountId={accountId}
                 onSwitchAccount={handleSwitchAccount}
                 onAddAccount={() => setShowIptvDialog(true)}
+                preferences={preferences}
+                onUpdatePreferences={(prefs) => {
+                    if (!token) return;
+                    setPreferences((prev) => ({ ...prev, ...prefs }));
+                    updatePreferences(token, prefs).catch(() => {
+                        // rollback on error
+                        setPreferences((prev) => ({ ...prev }));
+                    });
+                }}
             />
 
             <main className="relative">
@@ -830,6 +1278,9 @@ export default function App() {
                                 isFavoritesView={currentCategory === 'favorites'}
                                 favoriteIds={favoritesBySection[activeSection]}
                                 onToggleFavorite={handleToggleFavorite}
+                                vodProgressMap={vodProgressMap}
+                                seriesProgressMap={seriesProgressMap}
+                                accountId={accountId}
                             />
                         </div>
                     </motion.div>
@@ -841,10 +1292,31 @@ export default function App() {
                 title={playerTitle}
                 streamUrl={playerUrl}
                 streamSources={playerSources}
+                startTime={playerStartTime}
+                onProgress={handlePlayerProgress}
+                onEnded={handlePlayerEnded}
+                autoplay={preferences.autoplay}
+                nextEpisodeTitle={
+                    currentSeriesPlayContext
+                        ? (() => {
+                              const next = findNextEpisode(
+                                  currentSeriesPlayContext.seriesData,
+                                  currentSeriesPlayContext.currentEpisode.seasonNumber,
+                                  currentSeriesPlayContext.currentEpisode.episodeNumber
+                              );
+                              return next
+                                  ? `S${String(next.seasonNumber).padStart(2, '0')}E${String(next.episodeNumber).padStart(2, '0')} • ${next.title}`
+                                  : undefined;
+                          })()
+                        : undefined
+                }
+                onNextEpisode={handleNextEpisode}
                 onClose={() => {
                     setPlayerOpen(false);
                     setPlayerUrl(null);
                     setPlayerSources([]);
+                    setPlayerStartTime(undefined);
+                    currentlyPlayingRef.current = null;
                 }}
             />
 
@@ -852,9 +1324,11 @@ export default function App() {
                 open={seriesDetailOpen}
                 isDarkMode={isDarkMode}
                 data={seriesDetailData}
+                episodeProgress={episodeProgressMap}
                 onClose={() => {
                     setSeriesDetailOpen(false);
                     setSeriesDetailData(null);
+                    setSeriesDetailItemId(null);
                 }}
                 onPlayEpisode={handlePlayEpisode}
             />

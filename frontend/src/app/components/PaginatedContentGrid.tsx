@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react';
 import { motion } from 'motion/react';
 import { Loader2 } from 'lucide-react';
 import { ContentCard } from './ContentCard';
-import type { ContentItem, SectionType } from '../lib/api';
+import type { ContentItem, ProgressEntry, SeriesProgressSummary, SectionType } from '../lib/api';
 
 interface PaginatedContentGridProps {
     section: SectionType;
@@ -18,6 +18,9 @@ interface PaginatedContentGridProps {
     isFavoritesView?: boolean;
     favoriteIds?: Set<string>;
     onToggleFavorite?: (item: ContentItem) => void;
+    vodProgressMap?: Record<string, ProgressEntry>;
+    seriesProgressMap?: Record<string, SeriesProgressSummary>;
+    accountId?: number | null;
 }
 
 export function PaginatedContentGrid({
@@ -34,6 +37,9 @@ export function PaginatedContentGrid({
     isFavoritesView = false,
     favoriteIds,
     onToggleFavorite,
+    vodProgressMap = {},
+    seriesProgressMap = {},
+    accountId,
 }: PaginatedContentGridProps) {
     const sentinelRef = useRef<HTMLDivElement>(null);
 
@@ -84,6 +90,25 @@ export function PaginatedContentGrid({
                             onOpenRecordings={onOpenRecordings ? () => onOpenRecordings(item) : undefined}
                             isFavorite={favoriteIds?.has(item.id) ?? false}
                             onToggleFavorite={onToggleFavorite ? () => onToggleFavorite(item) : undefined}
+                            progress={
+                                section === 'films' && accountId
+                                    ? (() => {
+                                          const e = vodProgressMap[`${accountId}:${item.id}`];
+                                          return e ? { currentTime: e.currentTime, totalDuration: e.totalDuration, isWatched: e.isWatched } : undefined;
+                                      })()
+                                    : section === 'series' && accountId && item.seriesId
+                                    ? (() => {
+                                          const s = seriesProgressMap[`${accountId}:${item.seriesId}`];
+                                          if (!s?.lastEpisode) return undefined;
+                                          const { lastEpisode } = s;
+                                          return {
+                                              currentTime: lastEpisode.currentTime,
+                                              totalDuration: lastEpisode.totalDuration,
+                                              isWatched: lastEpisode.isWatched && s.watchedEpisodeIds.length > 0,
+                                          };
+                                      })()
+                                    : undefined
+                            }
                         />
                     </motion.div>
                 ))}

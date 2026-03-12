@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { motion } from 'motion/react';
 import { Shield, Volume2, Globe } from 'lucide-react';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from './ui/dialog';
-import type { IptvAccount } from '../lib/api';
+import type { IptvAccount, UserPreferences } from '../lib/api';
 
 interface SettingsDialogProps {
     open: boolean;
@@ -11,11 +11,22 @@ interface SettingsDialogProps {
     activeAccountId?: number | null;
     onSwitchAccount?: (accountId: number) => void;
     onAddAccount?: () => void;
+    preferences?: UserPreferences;
+    onUpdatePreferences?: (prefs: Partial<UserPreferences>) => void;
 }
 
-export function SettingsDialog({ open, onOpenChange, accounts = [], activeAccountId = null, onSwitchAccount, onAddAccount }: SettingsDialogProps) {
-    const [language, setLanguage] = useState('fr');
-    const [autoplay, setAutoplay] = useState(true);
+export function SettingsDialog({
+    open,
+    onOpenChange,
+    accounts = [],
+    activeAccountId = null,
+    onSwitchAccount,
+    onAddAccount,
+    preferences,
+    onUpdatePreferences,
+}: SettingsDialogProps) {
+    const language = preferences?.language ?? 'fr';
+    const autoplay = preferences?.autoplay ?? true;
 
     return (
         <Dialog open={open} onOpenChange={onOpenChange}>
@@ -78,7 +89,7 @@ export function SettingsDialog({ open, onOpenChange, accounts = [], activeAccoun
                         </div>
                         <select
                             value={language}
-                            onChange={(e) => setLanguage(e.target.value)}
+                            onChange={(e) => onUpdatePreferences?.({ language: e.target.value })}
                             className="w-full px-4 py-3 bg-white/5 border border-white/10 rounded-xl text-white focus:outline-none focus:border-red-500/50 focus:ring-2 focus:ring-red-500/20"
                         >
                             <option value="fr">Français</option>
@@ -101,7 +112,7 @@ export function SettingsDialog({ open, onOpenChange, accounts = [], activeAccoun
                                 <input
                                     type="checkbox"
                                     checked={autoplay}
-                                    onChange={(e) => setAutoplay(e.target.checked)}
+                                    onChange={(e) => onUpdatePreferences?.({ autoplay: e.target.checked })}
                                     className="sr-only peer"
                                 />
                                 <div className="w-14 h-7 bg-white/10 peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-red-500/20 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-0.5 after:start-[4px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-6 after:w-6 after:transition-all peer-checked:bg-gradient-to-r peer-checked:from-red-600 peer-checked:to-orange-600"></div>

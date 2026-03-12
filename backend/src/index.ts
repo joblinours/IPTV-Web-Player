@@ -215,6 +215,38 @@ function initDb() {
 
     CREATE INDEX IF NOT EXISTS idx_favorites_item
       ON favorites(item_id);
+
+    CREATE TABLE IF NOT EXISTS watch_progress (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      account_id INTEGER NOT NULL,
+      type TEXT NOT NULL CHECK(type IN ('vod', 'series_episode')),
+      item_id TEXT NOT NULL,
+      series_id TEXT,
+      season_number INTEGER,
+      episode_number INTEGER,
+      current_time REAL NOT NULL DEFAULT 0,
+      total_duration REAL NOT NULL DEFAULT 0,
+      is_watched INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id),
+      FOREIGN KEY(account_id) REFERENCES iptv_accounts(id),
+      UNIQUE(user_id, account_id, type, item_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_watch_progress_user_account_type
+      ON watch_progress(user_id, account_id, type);
+
+    CREATE INDEX IF NOT EXISTS idx_watch_progress_series
+      ON watch_progress(user_id, account_id, series_id);
+
+    CREATE TABLE IF NOT EXISTS user_preferences (
+      user_id INTEGER PRIMARY KEY,
+      autoplay INTEGER NOT NULL DEFAULT 1,
+      language TEXT NOT NULL DEFAULT 'fr',
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id)
+    );
   `);
 }
 
@@ -487,6 +519,252 @@ app.delete('/api/favorites', { preHandler: [app.authenticate] }, async (request:
 
   return { ok: true };
 });
+
+// ── Watch Progress ──────────────────────────────────────────────────────────
+
+app.post('/api/progress', { preHandler: [app.authenticate] }, async (request: any, reply) => {
+  const bodySchema = z.object({
+    accountId: z.coerce.number().int().positive(),
+    type: z.enum(['vod', 'series_episode']),
+    itemId: z.string().min(1),
+    seriesId: z.string().optional(),
+    seasonNumber: z.coerce.number().int().min(1).optional(),
+    episodeNumber: z.coerce.number().int().min(1).optional(),
+    currentTime: z.coerce.number().min(0),
+    totalDuration: z.coerce.number().min(0),
+    isWatched: z.boolean().optional(),
+  });
+
+  const parsed = bodySchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ message: 'Invalid payload' });
+  }
+
+  const account = db
+    .prepare('SELECT id FROM iptv_accounts WHERE id = ? AND user_id = ?')
+    .get(parsed.data.accountId, request.user.userId) as { id: number } | undefined;
+
+  if (!account) {
+    return reply.code(404).send({ message: 'Account not found' });
+  }
+
+  const remaining =
+    parsed.data.totalDuration > 0 ? parsed.data.totalDuration - parsed.data.currentTime : Infinity;
+  const autoWatched = parsed.data.totalDuration > 0 && remaining <= 10 ? 1 : 0;
+  const isWatched = parsed.data.isWatched === true ? 1 : autoWatched;
+
+  db.prepare(`
+    INSERT INTO watch_progress(user_id, account_id, type, item_id, series_id, season_number, episode_number, current_time, total_duration, is_watched, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_id, account_id, type, item_id) DO UPDATE SET
+      current_time = excluded.current_time,
+      total_duration = excluded.total_duration,
+      is_watched = MAX(watch_progress.is_watched, excluded.is_watched),
+      series_id = COALESCE(excluded.series_id, watch_progress.series_id),
+      season_number = COALESCE(excluded.season_number, watch_progress.season_number),
+      episode_number = COALESCE(excluded.episode_number, watch_progress.episode_number),
+      updated_at = excluded.updated_at
+  `).run(
+    request.user.userId,
+    parsed.data.accountId,
+    parsed.data.type,
+    parsed.data.itemId,
+    parsed.data.seriesId ?? null,
+    parsed.data.seasonNumber ?? null,
+    parsed.data.episodeNumber ?? null,
+    parsed.data.currentTime,
+    parsed.data.totalDuration,
+    isWatched,
+    nowEpoch()
+  );
+
+  return { ok: true };
+});
+
+app.get('/api/progress', { preHandler: [app.authenticate] }, async (request: any, reply) => {
+  const querySchema = z.object({
+    accountId: z.coerce.number().int().positive(),
+    type: z.enum(['vod', 'series_episode']),
+    itemIds: z.string().optional(),
+  });
+
+  const parsed = querySchema.safeParse(request.query);
+  if (!parsed.success) {
+    return reply.code(400).send({ message: 'Invalid query' });
+  }
+
+  const account = db
+    .prepare('SELECT id FROM iptv_accounts WHERE id = ? AND user_id = ?')
+    .get(parsed.data.accountId, request.user.userId) as { id: number } | undefined;
+
+  if (!account) {
+    return reply.code(404).send({ message: 'Account not found' });
+  }
+
+  const itemIds = parsed.data.itemIds
+    ? parsed.data.itemIds.split(',').map((id) => id.trim()).filter(Boolean).slice(0, 200)
+    : [];
+
+  if (itemIds.length === 0) {
+    return { items: [] };
+  }
+
+  const placeholders = itemIds.map(() => '?').join(',');
+  const rows = db
+    .prepare(
+      `SELECT item_id, current_time, total_duration, is_watched, updated_at
+       FROM watch_progress
+       WHERE user_id = ? AND account_id = ? AND type = ? AND item_id IN (${placeholders})`
+    )
+    .all(request.user.userId, parsed.data.accountId, parsed.data.type, ...itemIds) as Array<{
+      item_id: string;
+      current_time: number;
+      total_duration: number;
+      is_watched: number;
+      updated_at: number;
+    }>;
+
+  return {
+    items: rows.map((row) => ({
+      itemId: row.item_id,
+      currentTime: row.current_time,
+      totalDuration: row.total_duration,
+      isWatched: row.is_watched === 1,
+      updatedAt: row.updated_at,
+    })),
+  };
+});
+
+app.get('/api/progress/series', { preHandler: [app.authenticate] }, async (request: any, reply) => {
+  const querySchema = z.object({
+    accountId: z.coerce.number().int().positive(),
+    seriesId: z.string().min(1),
+  });
+
+  const parsed = querySchema.safeParse(request.query);
+  if (!parsed.success) {
+    return reply.code(400).send({ message: 'Invalid query' });
+  }
+
+  const account = db
+    .prepare('SELECT id FROM iptv_accounts WHERE id = ? AND user_id = ?')
+    .get(parsed.data.accountId, request.user.userId) as { id: number } | undefined;
+
+  if (!account) {
+    return reply.code(404).send({ message: 'Account not found' });
+  }
+
+  const rows = db
+    .prepare(
+      `SELECT item_id, current_time, total_duration, is_watched, season_number, episode_number, updated_at
+       FROM watch_progress
+       WHERE user_id = ? AND account_id = ? AND series_id = ?
+       ORDER BY updated_at DESC`
+    )
+    .all(request.user.userId, parsed.data.accountId, parsed.data.seriesId) as Array<{
+      item_id: string;
+      current_time: number;
+      total_duration: number;
+      is_watched: number;
+      season_number: number | null;
+      episode_number: number | null;
+      updated_at: number;
+    }>;
+
+  if (rows.length === 0) {
+    return { lastEpisode: null, watchedEpisodeIds: [] };
+  }
+
+  const lastRow = rows[0];
+  const watchedEpisodeIds = rows.filter((row) => row.is_watched === 1).map((row) => row.item_id);
+
+  return {
+    lastEpisode: {
+      episodeId: lastRow.item_id,
+      seasonNumber: lastRow.season_number,
+      episodeNumber: lastRow.episode_number,
+      currentTime: lastRow.current_time,
+      totalDuration: lastRow.total_duration,
+      isWatched: lastRow.is_watched === 1,
+    },
+    watchedEpisodeIds,
+  };
+});
+
+app.delete('/api/progress', { preHandler: [app.authenticate] }, async (request: any, reply) => {
+  const bodySchema = z.object({
+    accountId: z.coerce.number().int().positive(),
+    type: z.enum(['vod', 'series_episode']),
+    itemId: z.string().min(1),
+  });
+
+  const parsed = bodySchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ message: 'Invalid payload' });
+  }
+
+  const account = db
+    .prepare('SELECT id FROM iptv_accounts WHERE id = ? AND user_id = ?')
+    .get(parsed.data.accountId, request.user.userId) as { id: number } | undefined;
+
+  if (!account) {
+    return reply.code(404).send({ message: 'Account not found' });
+  }
+
+  db.prepare(
+    'DELETE FROM watch_progress WHERE user_id = ? AND account_id = ? AND type = ? AND item_id = ?'
+  ).run(request.user.userId, parsed.data.accountId, parsed.data.type, parsed.data.itemId);
+
+  return { ok: true };
+});
+
+// ── User Preferences ─────────────────────────────────────────────────────────
+
+app.get('/api/preferences', { preHandler: [app.authenticate] }, async (request: any) => {
+  const row = db
+    .prepare('SELECT autoplay, language FROM user_preferences WHERE user_id = ?')
+    .get(request.user.userId) as { autoplay: number; language: string } | undefined;
+
+  return {
+    autoplay: row ? row.autoplay === 1 : true,
+    language: row?.language ?? 'fr',
+  };
+});
+
+app.put('/api/preferences', { preHandler: [app.authenticate] }, async (request: any, reply) => {
+  const bodySchema = z.object({
+    autoplay: z.boolean().optional(),
+    language: z.string().min(2).max(5).optional(),
+  });
+
+  const parsed = bodySchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ message: 'Invalid payload' });
+  }
+
+  const existing = db
+    .prepare('SELECT autoplay, language FROM user_preferences WHERE user_id = ?')
+    .get(request.user.userId) as { autoplay: number; language: string } | undefined;
+
+  const autoplay =
+    parsed.data.autoplay !== undefined
+      ? parsed.data.autoplay ? 1 : 0
+      : (existing?.autoplay ?? 1);
+  const language = parsed.data.language ?? existing?.language ?? 'fr';
+
+  db.prepare(`
+    INSERT INTO user_preferences(user_id, autoplay, language, updated_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+      autoplay = excluded.autoplay,
+      language = excluded.language,
+      updated_at = excluded.updated_at
+  `).run(request.user.userId, autoplay, language, nowEpoch());
+
+  return { ok: true };
+});
+
+// ── IPTV ─────────────────────────────────────────────────────────────────────
 
 app.get('/api/iptv/categories', { preHandler: [app.authenticate] }, async (request: any, reply) => {
   const querySchema = z.object({

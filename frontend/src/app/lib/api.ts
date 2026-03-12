@@ -343,3 +343,97 @@ export function buildStreamProxyUrl(params: {
 
   return `${API_BASE_URL}/api/iptv/stream-proxy?${query.toString()}`;
 }
+
+// ── Watch Progress ────────────────────────────────────────────────────────────
+
+export interface ProgressEntry {
+  itemId: string;
+  currentTime: number;
+  totalDuration: number;
+  isWatched: boolean;
+  updatedAt: number;
+}
+
+export interface SeriesProgressSummary {
+  lastEpisode: {
+    episodeId: string;
+    seasonNumber: number | null;
+    episodeNumber: number | null;
+    currentTime: number;
+    totalDuration: number;
+    isWatched: boolean;
+  } | null;
+  watchedEpisodeIds: string[];
+}
+
+export interface UserPreferences {
+  autoplay: boolean;
+  language: string;
+}
+
+export async function fetchProgress(
+  token: string,
+  accountId: number,
+  type: 'vod' | 'series_episode',
+  itemIds: string[]
+): Promise<{ items: ProgressEntry[] }> {
+  const query = new URLSearchParams({
+    accountId: String(accountId),
+    type,
+    itemIds: itemIds.join(','),
+  });
+  return request<{ items: ProgressEntry[] }>(`/api/progress?${query.toString()}`, { method: 'GET' }, token);
+}
+
+export async function fetchSeriesProgress(
+  token: string,
+  accountId: number,
+  seriesId: string
+): Promise<SeriesProgressSummary> {
+  const query = new URLSearchParams({ accountId: String(accountId), seriesId });
+  return request<SeriesProgressSummary>(`/api/progress/series?${query.toString()}`, { method: 'GET' }, token);
+}
+
+export async function updateProgress(
+  token: string,
+  params: {
+    accountId: number;
+    type: 'vod' | 'series_episode';
+    itemId: string;
+    seriesId?: string;
+    seasonNumber?: number;
+    episodeNumber?: number;
+    currentTime: number;
+    totalDuration: number;
+    isWatched?: boolean;
+  }
+) {
+  return request<{ ok: boolean }>(
+    '/api/progress',
+    { method: 'POST', body: JSON.stringify(params) },
+    token
+  );
+}
+
+export async function clearProgress(
+  token: string,
+  params: { accountId: number; type: 'vod' | 'series_episode'; itemId: string }
+) {
+  return request<{ ok: boolean }>(
+    '/api/progress',
+    { method: 'DELETE', body: JSON.stringify(params) },
+    token
+  );
+}
+
+export async function fetchPreferences(token: string): Promise<UserPreferences> {
+  return request<UserPreferences>('/api/preferences', { method: 'GET' }, token);
+}
+
+export async function updatePreferences(token: string, prefs: Partial<UserPreferences>) {
+  return request<{ ok: boolean }>(
+    '/api/preferences',
+    { method: 'PUT', body: JSON.stringify(prefs) },
+    token
+  );
+}

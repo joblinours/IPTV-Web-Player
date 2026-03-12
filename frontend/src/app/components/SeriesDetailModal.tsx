@@ -1,7 +1,13 @@
 import { useEffect, useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { X, Play, CalendarDays, Clock3 } from 'lucide-react';
+import { X, Play, CalendarDays, Clock3, CheckCircle2 } from 'lucide-react';
 import type { SeriesEpisode, SeriesInfoResponse } from '../lib/api';
+
+interface EpisodeProgress {
+    currentTime: number;
+    totalDuration: number;
+    isWatched: boolean;
+}
 
 interface SeriesDetailModalProps {
     open: boolean;
@@ -9,6 +15,7 @@ interface SeriesDetailModalProps {
     data: SeriesInfoResponse | null;
     onClose: () => void;
     onPlayEpisode: (episode: SeriesEpisode) => void;
+    episodeProgress?: Record<string, EpisodeProgress>;
 }
 
 export function SeriesDetailModal({
@@ -17,6 +24,7 @@ export function SeriesDetailModal({
     data,
     onClose,
     onPlayEpisode,
+    episodeProgress = {},
 }: SeriesDetailModalProps) {
     const initialSeason = data?.seasons[0]?.seasonNumber ?? 1;
     const [selectedSeason, setSelectedSeason] = useState<number>(initialSeason);
@@ -86,13 +94,19 @@ export function SeriesDetailModal({
                                 {activeEpisodes.map((episode) => (
                                     <div
                                         key={episode.id}
-                                        className={`rounded-xl border p-3 sm:p-4 flex items-center justify-between gap-3 ${isDarkMode ? 'border-white/10 bg-white/5' : 'border-gray-200 bg-gray-50'
-                                            }`}
+                                        className={`rounded-xl border p-3 sm:p-4 flex items-center justify-between gap-3 ${
+                                            isDarkMode ? 'border-white/10 bg-white/5' : 'border-gray-200 bg-gray-50'
+                                        }`}
                                     >
-                                        <div className="min-w-0">
-                                            <p className="font-medium truncate">
+                                        <div className="min-w-0 flex-1">
+                                            <div className="flex items-center gap-1.5">
+                                                {episodeProgress[String(episode.id)]?.isWatched && (
+                                                    <CheckCircle2 size={14} className="text-green-500 shrink-0" />
+                                                )}
+                                                <p className={`font-medium truncate ${episodeProgress[String(episode.id)]?.isWatched ? 'text-gray-500' : ''}`}>
                                                 E{episode.episodeNumber.toString().padStart(2, '0')} • {episode.title}
-                                            </p>
+                                                </p>
+                                            </div>
                                             <div className={`text-xs mt-1 flex flex-wrap gap-3 ${isDarkMode ? 'text-gray-400' : 'text-gray-600'}`}>
                                                 {episode.airDate && (
                                                     <span className="inline-flex items-center gap-1">
@@ -107,14 +121,30 @@ export function SeriesDetailModal({
                                                     </span>
                                                 )}
                                             </div>
+                                            {/* Mini progress bar for in-progress episodes */}
+                                            {(() => {
+                                                const ep = episodeProgress[String(episode.id)];
+                                                if (!ep || ep.isWatched || ep.currentTime <= 0 || ep.totalDuration <= 0) return null;
+                                                const pct = Math.min(100, (ep.currentTime / ep.totalDuration) * 100);
+                                                return (
+                                                    <div className="mt-2 h-0.5 rounded-full bg-white/20 overflow-hidden">
+                                                        <div
+                                                            className="h-full bg-gradient-to-r from-red-600 to-orange-500"
+                                                            style={{ width: `${pct}%` }}
+                                                        />
+                                                    </div>
+                                                );
+                                            })()}
                                         </div>
 
                                         <button
                                             onClick={() => onPlayEpisode(episode)}
-                                            className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-white text-black font-semibold hover:bg-gray-200"
+                                            className="shrink-0 inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-white text-black font-semibold hover:bg-gray-200"
                                         >
                                             <Play size={15} fill="currentColor" />
-                                            Lire
+                                            {episodeProgress[String(episode.id)] && !episodeProgress[String(episode.id)].isWatched && episodeProgress[String(episode.id)].currentTime > 0
+                                                ? 'Reprendre'
+                                                : 'Lire'}
                                         </button>
                                     </div>
                                 ))}

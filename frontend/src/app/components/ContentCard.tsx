@@ -1,7 +1,13 @@
 import { useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { ImageWithFallback } from './figma/ImageWithFallback';
-import { Play, Radio, Plus, ChevronDown, Star, Calendar } from 'lucide-react';
+import { Play, Radio, Plus, ChevronDown, Star, Calendar, CheckCircle2 } from 'lucide-react';
+
+interface ContentCardProgress {
+  currentTime: number;
+  totalDuration: number;
+  isWatched: boolean;
+}
 
 interface ContentCardProps {
   title: string;
@@ -22,6 +28,7 @@ interface ContentCardProps {
   onOpenRecordings?: () => void;
   isFavorite?: boolean;
   onToggleFavorite?: () => void;
+  progress?: ContentCardProgress;
 }
 
 export function ContentCard({
@@ -43,6 +50,7 @@ export function ContentCard({
   onOpenRecordings,
   isFavorite = false,
   onToggleFavorite,
+  progress,
 }: ContentCardProps) {
   const [isHovered, setIsHovered] = useState(false);
 
@@ -90,6 +98,11 @@ export function ContentCard({
 
   const meta = getMetaInfo();
 
+  const showProgressBar = !!(progress && progress.currentTime > 0 && progress.totalDuration > 0 && !progress.isWatched);
+  const progressPercent = showProgressBar
+    ? Math.min(100, (progress!.currentTime / progress!.totalDuration) * 100)
+    : 0;
+
   return (
     <motion.div
       className="relative w-[280px] cursor-pointer"
@@ -109,6 +122,14 @@ export function ContentCard({
 
         {/* Gradient Overlay */}
         <div className="absolute inset-0 bg-gradient-to-t from-black via-transparent to-transparent opacity-60" />
+
+        {/* Watched badge */}
+        {progress?.isWatched && (
+          <div className="absolute top-2 left-2 flex items-center gap-1 px-1.5 py-0.5 bg-green-600/90 backdrop-blur-sm rounded-md">
+            <CheckCircle2 size={11} className="text-white" />
+            <span className="text-[10px] font-bold text-white">Vu</span>
+          </div>
+        )}
 
         {/* Live Badge */}
         {type === 'live' && (
@@ -162,6 +183,15 @@ export function ContentCard({
             <span className="w-1 h-1 bg-gray-500 rounded-full" />
             <span>{meta.secondary}</span>
           </div>
+          {/* Progress bar */}
+          {showProgressBar && (
+            <div className="mt-2 h-1 rounded-full bg-white/20 overflow-hidden">
+              <div
+                className="h-full bg-gradient-to-r from-red-600 to-orange-500 rounded-full"
+                style={{ width: `${progressPercent}%` }}
+              />
+            </div>
+          )}
         </div>
       </div>
 
