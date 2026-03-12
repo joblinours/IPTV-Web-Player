@@ -212,6 +212,7 @@ export default function App() {
     const [playerTitle, setPlayerTitle] = useState('');
     const [playerUrl, setPlayerUrl] = useState<string | null>(null);
     const [playerSources, setPlayerSources] = useState<string[]>([]);
+    const [playerIsLive, setPlayerIsLive] = useState(false);
 
     const [seriesDetailOpen, setSeriesDetailOpen] = useState(false);
     const [seriesDetailData, setSeriesDetailData] = useState<SeriesInfoResponse | null>(null);
@@ -613,6 +614,7 @@ export default function App() {
         setCurrentSeriesPlayContext(null);
         setPlayerStartTime(undefined);
         setPlayerRealDuration(undefined);
+        setPlayerIsLive(false);
         needsTranscodeFlagRef.current = false;
         currentlyPlayingRef.current = null;
     };
@@ -630,6 +632,7 @@ export default function App() {
         setPlayerOpen(false);
         setPlayerUrl(null);
         setPlayerSources([]);
+        setPlayerIsLive(false);
         setSeriesDetailOpen(false);
         setSeriesDetailData(null);
         setIptvSetupError(null);
@@ -715,6 +718,18 @@ export default function App() {
                 candidates.map(async (extension) => {
                     try {
                         if (section === 'live') {
+                            const mustProxy = window.location.protocol === 'https:';
+                            if (mustProxy) {
+                                return buildStreamProxyUrl({
+                                    token,
+                                    accountId,
+                                    section,
+                                    streamId,
+                                    containerExtension: extension,
+                                    debugContext,
+                                });
+                            }
+
                             const response = await fetchStreamUrl(token, {
                                 accountId,
                                 section,
@@ -722,6 +737,18 @@ export default function App() {
                                 containerExtension: extension,
                                 debugContext,
                             });
+
+                            if (/^http:\/\//i.test(response.url)) {
+                                return buildStreamProxyUrl({
+                                    token,
+                                    accountId,
+                                    section,
+                                    streamId,
+                                    containerExtension: extension,
+                                    debugContext,
+                                });
+                            }
+
                             return response.url;
                         }
 
@@ -772,11 +799,12 @@ export default function App() {
         [token, accountId]
     );
 
-    const openPlayer = (title: string, sources: string[]) => {
+    const openPlayer = (title: string, sources: string[], isLive = false) => {
         if (sources.length === 0) return;
         setPlayerTitle(title);
         setPlayerUrl(sources[0]);
         setPlayerSources(sources);
+        setPlayerIsLive(isLive);
         setPlayerOpen(true);
     };
 
@@ -963,6 +991,7 @@ export default function App() {
         setPlayerTitle(next.title);
         setPlayerUrl(sources[0]);
         setPlayerSources(sources);
+        setPlayerIsLive(false);
     }, [token, accountId, currentSeriesPlayContext, resolvePlaybackSources, episodeProgressMap]);
 
     const handlePreviousEpisode = useCallback(async () => {
@@ -1024,6 +1053,7 @@ export default function App() {
         setPlayerTitle(previous.title);
         setPlayerUrl(sources[0]);
         setPlayerSources(sources);
+        setPlayerIsLive(false);
     }, [token, accountId, currentSeriesPlayContext, resolvePlaybackSources, episodeProgressMap]);
 
     const handleOpenSeriesDetails = useCallback(
@@ -1205,17 +1235,20 @@ export default function App() {
                 const vodSources = vodProg?.needsTranscode
                     ? addSeekToTranscodeSources(reorderWithTranscodeFirst(rawVodSources), vodStartTimeSec)
                     : rawVodSources;
-                currentlyPlayingRef.current = {
-                    type: 'vod',
-                    itemId: item.id,
-                    accountId,
-                };
+                currentlyPlayingRef.current =
+                    activeSection === 'live'
+                        ? null
+                        : {
+                              type: 'vod',
+                              itemId: item.id,
+                              accountId,
+                          };
                 setCurrentSeriesPlayContext(null);
                 setPlayerStartTime(vodStartTimeSec);
                 const providerDuration = item.durationSeconds && item.durationSeconds > 0 ? item.durationSeconds : undefined;
                 setPlayerRealDuration(providerDuration ?? (vodProg?.totalDuration && vodProg.totalDuration > 0 ? vodProg.totalDuration : undefined));
                 needsTranscodeFlagRef.current = false;
-                openPlayer(item.title, vodSources);
+                openPlayer(item.title, vodSources, activeSection === 'live');
             } catch (error) {
                 console.error('Playback start failed', error);
             }
@@ -1510,6 +1543,7 @@ export default function App() {
                 onPreviousEpisode={handlePreviousEpisode}
                 realDuration={playerRealDuration}
                 onTranscodeFallback={handleTranscodeFallback}
+                isLive={playerIsLive}
                 keyboardEnabled={playerKeyboardEnabled}
                 onClose={() => {
                     setPlayerOpen(false);
@@ -1517,6 +1551,7 @@ export default function App() {
                     setPlayerSources([]);
                     setPlayerStartTime(undefined);
                     setPlayerRealDuration(undefined);
+                    setPlayerIsLive(false);
                     needsTranscodeFlagRef.current = false;
                     currentlyPlayingRef.current = null;
                 }}

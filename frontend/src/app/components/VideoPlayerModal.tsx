@@ -51,6 +51,8 @@ interface VideoPlayerModalProps {
     onTranscodeFallback?: () => void;
     /** Enable/disable keyboard shortcuts for this player instance */
     keyboardEnabled?: boolean;
+    /** Live channels should not expose seek/progress controls */
+    isLive?: boolean;
 }
 
 export function VideoPlayerModal({
@@ -69,6 +71,7 @@ export function VideoPlayerModal({
     realDuration,
     onTranscodeFallback,
     keyboardEnabled = true,
+    isLive = false,
 }: VideoPlayerModalProps) {
     const videoRef = useRef<HTMLVideoElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
@@ -176,11 +179,11 @@ export function VideoPlayerModal({
                 e.preventDefault();
                 v.paused ? v.play().catch(() => undefined) : v.pause();
                 resetControlsTimeout();
-            } else if (e.code === 'ArrowLeft') {
+            } else if (e.code === 'ArrowLeft' && !isLive) {
                 e.preventDefault();
                 v.currentTime = Math.max(0, v.currentTime - 10);
                 resetControlsTimeout();
-            } else if (e.code === 'ArrowRight') {
+            } else if (e.code === 'ArrowRight' && !isLive) {
                 e.preventDefault();
                 v.currentTime = v.currentTime + 10;
                 resetControlsTimeout();
@@ -205,7 +208,7 @@ export function VideoPlayerModal({
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
-    }, [open, keyboardEnabled, resetControlsTimeout]);
+    }, [open, keyboardEnabled, isLive, resetControlsTimeout]);
 
     // ── Main video management effect ─────────────────────────────────────────
     useEffect(() => {
@@ -407,6 +410,7 @@ export function VideoPlayerModal({
 
             const cb = onProgressRef.current;
             if (!cb) return;
+            if (isLive) return;
             const now = Date.now();
             if (now - progressThrottleRef.current < 5000) return;
             progressThrottleRef.current = now;
@@ -453,7 +457,7 @@ export function VideoPlayerModal({
             videoElement.load();
             if (hls) hls.destroy();
         };
-    }, [open, streamUrl, allSources]);
+    }, [open, streamUrl, allSources, isLive]);
 
     // ── Seek bar interaction ─────────────────────────────────────────────────
     const seekToRatio = (ratio: number) => {
@@ -474,6 +478,7 @@ export function VideoPlayerModal({
     };
 
     const handleSeekBarMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+        if (isLive) return;
         e.preventDefault();
         setIsDragging(true);
         seekToRatio(ratioFromMouseEvent(e));
@@ -504,6 +509,7 @@ export function VideoPlayerModal({
 
     const handleSkip = (e: React.MouseEvent, seconds: number) => {
         e.stopPropagation();
+        if (isLive) return;
         const v = videoRef.current;
         if (!v) return;
         v.currentTime = Math.max(0, v.currentTime + seconds);
@@ -579,31 +585,32 @@ export function VideoPlayerModal({
                         <div className="absolute inset-0 bg-gradient-to-t from-black/75 via-transparent to-transparent pointer-events-none" />
 
                         <div className="relative z-10 px-4 pb-4 pt-2 flex flex-col gap-2">
-                            {/* ── Seek bar ── */}
-                            <div
-                                ref={seekBarRef}
-                                className="w-full h-4 flex items-center cursor-pointer group"
-                                onMouseDown={handleSeekBarMouseDown}
-                            >
-                                <div className="relative w-full h-1 group-hover:h-1.5 transition-all duration-150 rounded-full bg-white/20">
-                                    {/* Buffered */}
-                                    <div
-                                        className="absolute inset-y-0 left-0 bg-white/35 rounded-full"
-                                        style={{ width: `${bufferedPct}%` }}
-                                    />
-                                    {/* Played */}
-                                    <div
-                                        className="absolute inset-y-0 left-0 bg-red-500 rounded-full"
-                                        style={{ width: `${progressPct}%` }}
-                                    >
+                            {!isLive && (
+                                <div
+                                    ref={seekBarRef}
+                                    className="w-full h-4 flex items-center cursor-pointer group"
+                                    onMouseDown={handleSeekBarMouseDown}
+                                >
+                                    <div className="relative w-full h-1 group-hover:h-1.5 transition-all duration-150 rounded-full bg-white/20">
+                                        {/* Buffered */}
                                         <div
-                                            className={`absolute right-0 top-1/2 -translate-y-1/2 translate-x-1/2 w-3 h-3 bg-white rounded-full shadow-md transition-opacity ${
-                                                isDragging ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
-                                            }`}
+                                            className="absolute inset-y-0 left-0 bg-white/35 rounded-full"
+                                            style={{ width: `${bufferedPct}%` }}
                                         />
+                                        {/* Played */}
+                                        <div
+                                            className="absolute inset-y-0 left-0 bg-red-500 rounded-full"
+                                            style={{ width: `${progressPct}%` }}
+                                        >
+                                            <div
+                                                className={`absolute right-0 top-1/2 -translate-y-1/2 translate-x-1/2 w-3 h-3 bg-white rounded-full shadow-md transition-opacity ${
+                                                    isDragging ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                                                }`}
+                                            />
+                                        </div>
                                     </div>
                                 </div>
-                            </div>
+                            )}
 
                             {/* ── Bottom controls row ── */}
                             <div className="flex items-center gap-3">
@@ -616,23 +623,25 @@ export function VideoPlayerModal({
                                     {isPlaying ? <Pause size={20} fill="currentColor" /> : <Play size={20} fill="currentColor" />}
                                 </button>
 
-                                {/* Skip −10 s */}
-                                <button
-                                    onClick={(e: React.MouseEvent) => handleSkip(e, -10)}
-                                    className="text-white hover:text-red-400 transition-colors shrink-0"
-                                    aria-label="Reculer 10 secondes"
-                                >
-                                    <RotateCcw size={16} />
-                                </button>
+                                {!isLive && (
+                                    <button
+                                        onClick={(e: React.MouseEvent) => handleSkip(e, -10)}
+                                        className="text-white hover:text-red-400 transition-colors shrink-0"
+                                        aria-label="Reculer 10 secondes"
+                                    >
+                                        <RotateCcw size={16} />
+                                    </button>
+                                )}
 
-                                {/* Skip +10 s */}
-                                <button
-                                    onClick={(e: React.MouseEvent) => handleSkip(e, 10)}
-                                    className="text-white hover:text-red-400 transition-colors shrink-0"
-                                    aria-label="Avancer 10 secondes"
-                                >
-                                    <RotateCw size={16} />
-                                </button>
+                                {!isLive && (
+                                    <button
+                                        onClick={(e: React.MouseEvent) => handleSkip(e, 10)}
+                                        className="text-white hover:text-red-400 transition-colors shrink-0"
+                                        aria-label="Avancer 10 secondes"
+                                    >
+                                        <RotateCw size={16} />
+                                    </button>
+                                )}
 
                                 {/* Volume */}
                                 <div className="flex items-center gap-1.5 group/vol shrink-0">
@@ -656,10 +665,13 @@ export function VideoPlayerModal({
                                     />
                                 </div>
 
-                                {/* Time display */}
-                                <span className="text-white/90 text-xs font-mono tabular-nums ml-1 shrink-0">
-                                    {fmtTime(currentTimeSec)}&nbsp;/&nbsp;{effectiveDuration > 0 ? fmtTime(effectiveDuration) : '--:--'}
-                                </span>
+                                {isLive ? (
+                                    <span className="text-red-400 text-xs font-semibold tracking-wide ml-1 shrink-0">LIVE</span>
+                                ) : (
+                                    <span className="text-white/90 text-xs font-mono tabular-nums ml-1 shrink-0">
+                                        {fmtTime(currentTimeSec)}&nbsp;/&nbsp;{effectiveDuration > 0 ? fmtTime(effectiveDuration) : '--:--'}
+                                    </span>
+                                )}
 
                                 <div className="flex-1" />
 
