@@ -22,6 +22,7 @@ import {
     fetchSeriesProgress,
     fetchPreferences,
     fetchReplayUrl,
+    fetchStreamUrl,
     buildStreamProxyUrl,
     buildTranscodeUrl,
     listIptvAccounts,
@@ -713,6 +714,17 @@ export default function App() {
             const urls = await Promise.all(
                 candidates.map(async (extension) => {
                     try {
+                        if (section === 'live') {
+                            const response = await fetchStreamUrl(token, {
+                                accountId,
+                                section,
+                                streamId,
+                                containerExtension: extension,
+                                debugContext,
+                            });
+                            return response.url;
+                        }
+
                         return buildStreamProxyUrl({
                             token,
                             accountId,

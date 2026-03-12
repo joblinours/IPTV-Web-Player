@@ -269,11 +269,21 @@ export function VideoPlayerModal({
             let stableChecks = 0;
             let lastVideoDecoded = -1;
             let lastAudioDecoded = -1;
+            const startedAt = Date.now();
 
             watchdogTimer = window.setInterval(() => {
                 if (switchedByWatchdog) return;
                 if (sourceIndex >= allSources.length - 1) return;
                 if (videoElement.paused || videoElement.ended) return;
+
+                const elapsed = Date.now() - startedAt;
+                const notStartedYet = videoElement.currentTime < 0.2 || videoElement.readyState < 2;
+                if (elapsed > 10000 && notStartedYet) {
+                    switchedByWatchdog = true;
+                    tryNextSource();
+                    return;
+                }
+
                 if (videoElement.currentTime < 6) return;
 
                 const videoDecoded = Number((videoElement as any).webkitDecodedFrameCount ?? -1);
