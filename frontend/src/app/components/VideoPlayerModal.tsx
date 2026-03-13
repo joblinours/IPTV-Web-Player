@@ -278,6 +278,10 @@ export function VideoPlayerModal({
         const startWatchdog = (url: string) => {
             clearWatchdog();
             switchedByWatchdog = false;
+            const isTranscodeUrl = url.includes('/api/iptv/transcode');
+            const startupGraceMs = isTranscodeUrl ? 30000 : 10000;
+            const minPlaybackSecondsBeforeDecodeChecks = isTranscodeUrl ? 12 : 6;
+            const stableChecksLimit = isTranscodeUrl ? 6 : 3;
 
             let stableChecks = 0;
             let lastVideoDecoded = -1;
@@ -291,13 +295,13 @@ export function VideoPlayerModal({
 
                 const elapsed = Date.now() - startedAt;
                 const notStartedYet = videoElement.currentTime < 0.2 || videoElement.readyState < 2;
-                if (elapsed > 10000 && notStartedYet) {
+                if (elapsed > startupGraceMs && notStartedYet) {
                     switchedByWatchdog = true;
                     tryNextSource();
                     return;
                 }
 
-                if (videoElement.currentTime < 6) return;
+                if (videoElement.currentTime < minPlaybackSecondsBeforeDecodeChecks) return;
 
                 const videoDecoded = Number((videoElement as any).webkitDecodedFrameCount ?? -1);
                 const audioDecoded = Number((videoElement as any).webkitAudioDecodedByteCount ?? -1);
@@ -316,7 +320,7 @@ export function VideoPlayerModal({
                     stableChecks = stalled ? stableChecks + 1 : 0;
                     lastVideoDecoded = videoDecoded;
                     lastAudioDecoded = audioDecoded;
-                    if (stableChecks >= 3) {
+                    if (stableChecks >= stableChecksLimit) {
                         switchedByWatchdog = true;
                         tryNextSource();
                     }
@@ -360,6 +364,13 @@ export function VideoPlayerModal({
                 hls.loadSource(url);
                 hls.attachMedia(videoElement);
                 hls.on(Hls.Events.ERROR, (_: string, data: { fatal: boolean; type?: string }) => {
+                    const responseCode = Number((data as any)?.response?.code ?? 0);
+                    // Upstream explicit failures should not be retried indefinitely by HLS.
+                    if (responseCode >= 400) {
+                        tryNextSource();
+                        return;
+                    }
+
                     if (!data.fatal) return;
 
                     if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !hlsRecoverAttempted) {

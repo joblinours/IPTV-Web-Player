@@ -782,8 +782,8 @@ export default function App() {
                     // Keep MKV transcode near the top as it is often the first playable source.
                     urls.splice(1, 0, transcodeUrl);
                 } else {
-                    // Add transcode as a robust fallback when upstream proxy formats fail.
-                    urls.push(transcodeUrl);
+                    // Place transcode before late-format retries (like m3u8) to avoid long dead ends.
+                    urls.splice(Math.min(2, urls.length), 0, transcodeUrl);
                 }
             }
 
