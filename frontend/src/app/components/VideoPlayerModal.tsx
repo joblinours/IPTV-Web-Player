@@ -25,6 +25,17 @@ function isHlsSource(url: string): boolean {
     }
 }
 
+function withSeekSeconds(source: string, seekSeconds: number): string {
+    try {
+        const isAbsolute = /^https?:\/\//i.test(source);
+        const parsed = isAbsolute ? new URL(source) : new URL(source, window.location.origin);
+        parsed.searchParams.set('seekSeconds', Math.max(0, seekSeconds).toFixed(3));
+        return isAbsolute ? parsed.toString() : `${parsed.pathname}${parsed.search}${parsed.hash}`;
+    } catch {
+        return source;
+    }
+}
+
 interface VideoPlayerModalProps {
     open: boolean;
     title: string;
@@ -267,7 +278,6 @@ export function VideoPlayerModal({
         const startWatchdog = (url: string) => {
             clearWatchdog();
             switchedByWatchdog = false;
-            if (url.includes('/api/iptv/transcode')) return;
 
             let stableChecks = 0;
             let lastVideoDecoded = -1;
@@ -465,6 +475,21 @@ export function VideoPlayerModal({
         if (!v || effectiveDuration <= 0) return;
         const clamped = Math.max(0, Math.min(1, ratio));
         const targetEffectiveTime = clamped * effectiveDuration;
+        const activeUrl = activeSourceUrlRef.current ?? '';
+        const isTranscodeSource = activeUrl.includes('/api/iptv/transcode');
+
+        if (isTranscodeSource && targetEffectiveTime + 0.25 < seekOffsetRef.current) {
+            const seekUrl = withSeekSeconds(activeUrl, targetEffectiveTime);
+            activeSourceUrlRef.current = seekUrl;
+            seekOffsetRef.current = targetEffectiveTime;
+            v.pause();
+            v.src = seekUrl;
+            v.load();
+            v.play().catch(() => undefined);
+            setCurrentTimeSec(targetEffectiveTime);
+            return;
+        }
+
         // Adjust for the server-side seek offset already baked into the stream
         v.currentTime = Math.max(0, targetEffectiveTime - seekOffsetRef.current);
         setCurrentTimeSec(targetEffectiveTime);

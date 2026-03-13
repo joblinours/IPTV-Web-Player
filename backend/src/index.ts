@@ -1350,22 +1350,41 @@ app.get('/api/iptv/replay-url', { preHandler: [app.authenticate] }, async (reque
   return { url };
 });
 
-// Helper: Parse HTTP Range header (e.g., "bytes=1000-2000")
+// Helper: Parse HTTP Range header (e.g., "bytes=1000-2000", "bytes=1000-", "bytes=-500")
 function parseRangeHeader(rangeHeader: string | undefined, totalBytes: number): { start: number; end: number } | null {
   if (!rangeHeader || !rangeHeader.startsWith('bytes=')) return null;
 
-  const rangePart = rangeHeader.slice(6); // Remove "bytes="
-  const parts = rangePart.split('-');
+  const rangePart = rangeHeader.slice(6).trim();
+  if (!rangePart || rangePart.includes(',')) return null;
 
+  const parts = rangePart.split('-');
   if (parts.length !== 2) return null;
 
-  const start = parts[0] ? parseInt(parts[0], 10) : 0;
-  const end = parts[1] ? parseInt(parts[1], 10) : totalBytes - 1;
+  const startRaw = parts[0].trim();
+  const endRaw = parts[1].trim();
 
-  if (isNaN(start) || isNaN(end) || start > end || start < 0 || end >= totalBytes) {
-    return null;
+  let start = 0;
+  let end = totalBytes - 1;
+
+  if (startRaw === '' && endRaw === '') return null;
+
+  if (startRaw === '') {
+    const suffixLength = Number.parseInt(endRaw, 10);
+    if (!Number.isFinite(suffixLength) || suffixLength <= 0) return null;
+    start = Math.max(0, totalBytes - suffixLength);
+    end = totalBytes - 1;
+  } else {
+    start = Number.parseInt(startRaw, 10);
+    if (!Number.isFinite(start) || start < 0 || start >= totalBytes) return null;
+
+    if (endRaw !== '') {
+      const parsedEnd = Number.parseInt(endRaw, 10);
+      if (!Number.isFinite(parsedEnd) || parsedEnd < start) return null;
+      end = Math.min(parsedEnd, totalBytes - 1);
+    }
   }
 
+  if (start > end) return null;
   return { start, end };
 }
 
@@ -1467,9 +1486,9 @@ app.get('/api/iptv/transcode', async (request: any, reply) => {
     }
 
     if (durationSeconds && durationSeconds > 0) {
-      // Estimate file size: assuming ~1 Mbps for MP4 transcode
-      const estimatedBitrate = 1_000_000; // 1 Mbps in bytes per second
-      const estimatedTotalBytes = Math.floor(durationSeconds * estimatedBitrate / 8);
+      // Estimate file size using a conservative default transcode bitrate budget.
+      const estimatedBitrateBitsPerSecond = 4_000_000; // 4 Mbps
+      const estimatedTotalBytes = Math.max(1, Math.floor((durationSeconds * estimatedBitrateBitsPerSecond) / 8));
 
       const range = parseRangeHeader(rangeHeader, estimatedTotalBytes);
       if (range) {
@@ -1477,10 +1496,9 @@ app.get('/api/iptv/transcode', async (request: any, reply) => {
         responseStatusCode = 206;
 
         // Map byte range to time range
-        const bytesPerSecond = estimatedTotalBytes / durationSeconds;
+        const bytesPerSecond = Math.max(1, estimatedTotalBytes / durationSeconds);
         const startSeconds = Math.floor(range.start / bytesPerSecond);
         const endSeconds = Math.floor(range.end / bytesPerSecond);
-        const rangeSeconds = Math.max(1, endSeconds - startSeconds);
 
         seekSeconds = startSeconds;
         contentRangeHeader = `bytes ${range.start}-${range.end}/${estimatedTotalBytes}`;

@@ -777,6 +777,7 @@ export default function App() {
                         section,
                         streamId,
                         containerExtension: 'mkv',
+                        durationSeconds: item.durationSeconds,
                         debugContext,
                     })
                 );
@@ -790,6 +791,7 @@ export default function App() {
                         section,
                         streamId,
                         containerExtension: normalizedContainer || 'ts',
+                        durationSeconds: item.durationSeconds,
                         debugContext,
                     })
                 );
@@ -947,6 +949,7 @@ export default function App() {
             // Clear the progress maps
             setVodProgressMap({});
             setSeriesProgressMap({});
+            setEpisodeProgressMap({});
         } catch (error) {
             console.error('Failed to clear watch history:', error);
             throw error;
