@@ -767,20 +767,24 @@ export default function App() {
                 })
             );
 
-            if ((section === 'films' || section === 'series') && normalizedContainer === 'mkv') {
-                urls.splice(
-                    1,
-                    0,
-                    buildTranscodeUrl({
-                        token,
-                        accountId,
-                        section,
-                        streamId,
-                        containerExtension: 'mkv',
-                        durationSeconds: item.durationSeconds,
-                        debugContext,
-                    })
-                );
+            if (section === 'films' || section === 'series') {
+                const transcodeUrl = buildTranscodeUrl({
+                    token,
+                    accountId,
+                    section,
+                    streamId,
+                    containerExtension: normalizedContainer || 'mp4',
+                    durationSeconds: item.durationSeconds,
+                    debugContext,
+                });
+
+                if (normalizedContainer === 'mkv') {
+                    // Keep MKV transcode near the top as it is often the first playable source.
+                    urls.splice(1, 0, transcodeUrl);
+                } else {
+                    // Add transcode as a robust fallback when upstream proxy formats fail.
+                    urls.push(transcodeUrl);
+                }
             }
 
             if (section === 'live') {

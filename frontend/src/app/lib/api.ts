@@ -125,21 +125,40 @@ function sectionToBackendType(section: SectionType): BackendType {
 }
 
 async function request<T>(path: string, options: RequestInit = {}, token?: string): Promise<T> {
+  const headers = new Headers(options.headers ?? {});
+  const hasBody = options.body !== undefined && options.body !== null;
+
+  if (hasBody && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json');
+  }
+
+  if (token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(options.headers ?? {}),
-    },
+    headers,
   });
 
   if (!response.ok) {
-    const body = await response.json().catch(() => ({}));
-    throw new Error(body.message ?? 'Request failed');
+    const body = await response.json().catch(() => null);
+    if (body && typeof body.message === 'string' && body.message.length > 0) {
+      throw new Error(body.message);
+    }
+    throw new Error(`Request failed (${response.status})`);
   }
 
-  return response.json() as Promise<T>;
+  if (response.status === 204) {
+    return {} as T;
+  }
+
+  const contentType = response.headers.get('content-type') ?? '';
+  if (contentType.includes('application/json')) {
+    return response.json() as Promise<T>;
+  }
+
+  return (await response.text()) as T;
 }
 
 export async function register(payload: LoginPayload) {

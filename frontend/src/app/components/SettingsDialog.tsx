@@ -40,12 +40,17 @@ export function SettingsDialog({
     const autoplay = preferences?.autoplay ?? true;
     const [showClearConfirmation, setShowClearConfirmation] = useState(false);
     const [isClearing, setIsClearing] = useState(false);
+    const [clearError, setClearError] = useState<string | null>(null);
 
     const handleClearHistoryConfirm = async () => {
         setIsClearing(true);
+        setClearError(null);
         try {
             await onClearWatchHistory?.();
             setShowClearConfirmation(false);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Erreur lors de la suppression';
+            setClearError(message);
         } finally {
             setIsClearing(false);
         }
@@ -218,6 +223,9 @@ export function SettingsDialog({
                         {isClearing ? 'Suppression...' : 'Supprimer'}
                     </AlertDialogAction>
                 </div>
+                {clearError && (
+                    <p className="mt-2 text-sm text-red-300">{clearError}</p>
+                )}
             </AlertDialogContent>
         </AlertDialog>
         </>
