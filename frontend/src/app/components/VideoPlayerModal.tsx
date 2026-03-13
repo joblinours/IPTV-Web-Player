@@ -120,6 +120,7 @@ export function VideoPlayerModal({
     const queuedTranscodeSeekRef = useRef<number | null>(null);
     const transcodeSeekUnlockTimerRef = useRef<number | null>(null);
     const loadSourceRef = useRef<((url: string) => void) | null>(null);
+    const transcodeRecoveryAttemptsRef = useRef(0);
 
     // ── Custom player UI state ───────────────────────────────────────────────
     const [isPlaying, setIsPlaying] = useState(false);
@@ -177,6 +178,7 @@ export function VideoPlayerModal({
             suppressErrorsUntilRef.current = 0;
             transcodeSeekInFlightRef.current = false;
             queuedTranscodeSeekRef.current = null;
+            transcodeRecoveryAttemptsRef.current = 0;
             if (transcodeSeekUnlockTimerRef.current !== null) {
                 window.clearTimeout(transcodeSeekUnlockTimerRef.current);
                 transcodeSeekUnlockTimerRef.current = null;
@@ -249,6 +251,7 @@ export function VideoPlayerModal({
         isTranscodeModeRef.current = false;
         activeSourceUrlRef.current = null;
         seekOffsetRef.current = 0;
+        transcodeRecoveryAttemptsRef.current = 0;
         setCurrentTimeSec(0);
         setEffectiveDuration(0);
         effectiveDurationRef.current = 0;
@@ -461,6 +464,11 @@ export function VideoPlayerModal({
             const effectiveCt = videoElement.currentTime + seekOffsetRef.current;
             setCurrentTimeSec(effectiveCt);
 
+            // A stable progression means recovery budget can be reset.
+            if (effectiveCt > 15 && transcodeRecoveryAttemptsRef.current > 0) {
+                transcodeRecoveryAttemptsRef.current = 0;
+            }
+
             if (videoElement.buffered.length > 0) {
                 setBufferedEnd(
                     videoElement.buffered.end(videoElement.buffered.length - 1) +
@@ -485,9 +493,29 @@ export function VideoPlayerModal({
         const handlePause = () => setIsPlaying(false);
 
         const handleEnded = () => {
-            setIsPlaying(false);
             const dur = resolveDuration();
-            const ct = dur > 0 ? dur : videoElement.currentTime + seekOffsetRef.current;
+            const effectiveCt = videoElement.currentTime + seekOffsetRef.current;
+            const ct = dur > 0 ? Math.min(dur, effectiveCt) : effectiveCt;
+            const activeUrl = activeSourceUrlRef.current ?? '';
+            const isTranscodeSource = activeUrl.includes('/api/iptv/transcode');
+            const remaining = dur > 0 ? dur - ct : 0;
+
+            if (
+                isTranscodeSource &&
+                dur > 0 &&
+                remaining > 20 &&
+                transcodeRecoveryAttemptsRef.current < 6
+            ) {
+                transcodeRecoveryAttemptsRef.current += 1;
+                const resumeAt = Math.max(0, Math.min(dur - 1, ct + 0.75));
+                const resumeUrl = withSeekSeconds(activeUrl, resumeAt);
+                suppressErrorsUntilRef.current = Date.now() + 2000;
+                setCurrentTimeSec(resumeAt);
+                loadSourceRef.current?.(resumeUrl);
+                return;
+            }
+
+            setIsPlaying(false);
             onEndedRef.current?.(ct, dur);
             if (autoplayRef.current && nextEpisodeTitleRef.current && onNextEpisodeRef.current) {
                 setAutoplayCountdown(AUTOPLAY_COUNTDOWN_START);

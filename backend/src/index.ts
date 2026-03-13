@@ -1528,6 +1528,19 @@ app.get('/api/iptv/transcode', async (request: any, reply) => {
     '+genpts',
   ];
 
+  if (/^https?:\/\//i.test(sourceUrl)) {
+    ffmpegArgs.push(
+      '-reconnect',
+      '1',
+      '-reconnect_streamed',
+      '1',
+      '-reconnect_delay_max',
+      '5',
+      '-rw_timeout',
+      '15000000',
+    );
+  }
+
   if (seekSeconds > 0) {
     ffmpegArgs.push('-ss', seekSeconds.toFixed(3));
   }
