@@ -115,6 +115,10 @@ export function VideoPlayerModal({
     const progressThrottleRef = useRef<number>(0);
     const isTranscodeModeRef = useRef(false);
     const controlsTimeoutRef = useRef<number | null>(null);
+    const suppressErrorsUntilRef = useRef<number>(0);
+    const transcodeSeekInFlightRef = useRef(false);
+    const queuedTranscodeSeekRef = useRef<number | null>(null);
+    const transcodeSeekUnlockTimerRef = useRef<number | null>(null);
 
     // ── Custom player UI state ───────────────────────────────────────────────
     const [isPlaying, setIsPlaying] = useState(false);
@@ -169,6 +173,13 @@ export function VideoPlayerModal({
             effectiveDurationRef.current = 0;
             setBufferedEnd(0);
             setShowControls(true);
+            suppressErrorsUntilRef.current = 0;
+            transcodeSeekInFlightRef.current = false;
+            queuedTranscodeSeekRef.current = null;
+            if (transcodeSeekUnlockTimerRef.current !== null) {
+                window.clearTimeout(transcodeSeekUnlockTimerRef.current);
+                transcodeSeekUnlockTimerRef.current = null;
+            }
         }
     }, [open]);
 
@@ -365,6 +376,10 @@ export function VideoPlayerModal({
                 hls.loadSource(url);
                 hls.attachMedia(videoElement);
                 hls.on(Hls.Events.ERROR, (_: string, data: { fatal: boolean; type?: string }) => {
+                    if (Date.now() < suppressErrorsUntilRef.current) {
+                        return;
+                    }
+
                     const responseCode = Number((data as any)?.response?.code ?? 0);
                     // Upstream explicit failures should not be retried indefinitely by HLS.
                     if (responseCode >= 400) {
@@ -398,9 +413,29 @@ export function VideoPlayerModal({
             }
         };
 
-        const handleError = () => tryNextSource();
+        const handleError = () => {
+            if (Date.now() < suppressErrorsUntilRef.current) {
+                return;
+            }
+            tryNextSource();
+        };
 
         const handleCanPlay = () => {
+            if (transcodeSeekInFlightRef.current) {
+                transcodeSeekInFlightRef.current = false;
+                if (transcodeSeekUnlockTimerRef.current !== null) {
+                    window.clearTimeout(transcodeSeekUnlockTimerRef.current);
+                    transcodeSeekUnlockTimerRef.current = null;
+                }
+                const queued = queuedTranscodeSeekRef.current;
+                queuedTranscodeSeekRef.current = null;
+                if (queued !== null && effectiveDurationRef.current > 0) {
+                    window.setTimeout(() => {
+                        seekToRatio(queued / effectiveDurationRef.current, true);
+                    }, 0);
+                }
+            }
+
             refreshDuration();
             if (didSeek) return;
 
@@ -467,6 +502,10 @@ export function VideoPlayerModal({
 
         return () => {
             clearWatchdog();
+            if (transcodeSeekUnlockTimerRef.current !== null) {
+                window.clearTimeout(transcodeSeekUnlockTimerRef.current);
+                transcodeSeekUnlockTimerRef.current = null;
+            }
             videoElement.removeEventListener('error', handleError);
             videoElement.removeEventListener('canplay', handleCanPlay);
             videoElement.removeEventListener('timeupdate', handleTimeUpdate);
@@ -495,6 +534,28 @@ export function VideoPlayerModal({
                 setCurrentTimeSec(targetEffectiveTime);
                 return;
             }
+
+            if (transcodeSeekInFlightRef.current) {
+                queuedTranscodeSeekRef.current = targetEffectiveTime;
+                setCurrentTimeSec(targetEffectiveTime);
+                return;
+            }
+
+            transcodeSeekInFlightRef.current = true;
+            suppressErrorsUntilRef.current = Date.now() + 1500;
+            if (transcodeSeekUnlockTimerRef.current !== null) {
+                window.clearTimeout(transcodeSeekUnlockTimerRef.current);
+            }
+            transcodeSeekUnlockTimerRef.current = window.setTimeout(() => {
+                transcodeSeekInFlightRef.current = false;
+                transcodeSeekUnlockTimerRef.current = null;
+                const queued = queuedTranscodeSeekRef.current;
+                queuedTranscodeSeekRef.current = null;
+                const dur = effectiveDurationRef.current;
+                if (queued !== null && dur > 0) {
+                    seekToRatio(queued / dur, true);
+                }
+            }, 2000);
 
             const seekUrl = withSeekSeconds(activeUrl, targetEffectiveTime);
             activeSourceUrlRef.current = seekUrl;
