@@ -33,6 +33,8 @@ type XtreamStream = {
   tv_archive?: number | string;
   tv_archive_duration?: number | string;
   epg_channel_id?: string;
+  duration?: string;
+  duration_secs?: number | string;
 };
 
 type XtreamSeriesEpisode = {
@@ -91,6 +93,7 @@ const env = {
   encryptionSecret: process.env.APP_ENCRYPTION_SECRET ?? 'change-me-32-char-minimum-secret',
   corsOrigin: process.env.CORS_ORIGIN ?? 'http://localhost:5173',
   cacheTtlSeconds: Number(process.env.CACHE_TTL_SECONDS ?? 120),
+  streamProxyTimeoutMs: Number(process.env.STREAM_PROXY_TIMEOUT_MS ?? 20000),
 };
 
 if (env.encryptionSecret.length < 32) {
@@ -215,10 +218,48 @@ function initDb() {
 
     CREATE INDEX IF NOT EXISTS idx_favorites_item
       ON favorites(item_id);
+
+    CREATE TABLE IF NOT EXISTS watch_progress (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      account_id INTEGER NOT NULL,
+      type TEXT NOT NULL CHECK(type IN ('vod', 'series_episode')),
+      item_id TEXT NOT NULL,
+      series_id TEXT,
+      season_number INTEGER,
+      episode_number INTEGER,
+      current_time REAL NOT NULL DEFAULT 0,
+      total_duration REAL NOT NULL DEFAULT 0,
+      is_watched INTEGER NOT NULL DEFAULT 0,
+      needs_transcode INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id),
+      FOREIGN KEY(account_id) REFERENCES iptv_accounts(id),
+      UNIQUE(user_id, account_id, type, item_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_watch_progress_user_account_type
+      ON watch_progress(user_id, account_id, type);
+
+    CREATE INDEX IF NOT EXISTS idx_watch_progress_series
+      ON watch_progress(user_id, account_id, series_id);
+
+    CREATE TABLE IF NOT EXISTS user_preferences (
+      user_id INTEGER PRIMARY KEY,
+      autoplay INTEGER NOT NULL DEFAULT 1,
+      language TEXT NOT NULL DEFAULT 'fr',
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id)
+    );
   `);
 }
 
 initDb();
+
+// Migration: add needs_transcode column if it doesn't exist yet (safe on fresh DB too)
+try {
+  db.exec(`ALTER TABLE watch_progress ADD COLUMN needs_transcode INTEGER NOT NULL DEFAULT 0`);
+} catch { /* column already exists */ }
 
 const registerSchema = z.object({
   email: z.string().email(),
@@ -488,6 +529,290 @@ app.delete('/api/favorites', { preHandler: [app.authenticate] }, async (request:
   return { ok: true };
 });
 
+// ── Watch Progress ──────────────────────────────────────────────────────────
+
+app.post('/api/progress', { preHandler: [app.authenticate] }, async (request: any, reply) => {
+  const bodySchema = z.object({
+    accountId: z.coerce.number().int().positive(),
+    type: z.enum(['vod', 'series_episode']),
+    itemId: z.string().min(1),
+    seriesId: z.string().optional(),
+    seasonNumber: z.coerce.number().int().min(1).optional(),
+    episodeNumber: z.coerce.number().int().min(1).optional(),
+    currentTime: z.coerce.number().min(0),
+    totalDuration: z.coerce.number().min(0),
+    isWatched: z.boolean().optional(),
+    needsTranscode: z.boolean().optional(),
+  });
+
+  const parsed = bodySchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ message: 'Invalid payload' });
+  }
+
+  const account = db
+    .prepare('SELECT id FROM iptv_accounts WHERE id = ? AND user_id = ?')
+    .get(parsed.data.accountId, request.user.userId) as { id: number } | undefined;
+
+  if (!account) {
+    return reply.code(404).send({ message: 'Account not found' });
+  }
+
+  const remaining =
+    parsed.data.totalDuration > 0 ? parsed.data.totalDuration - parsed.data.currentTime : Infinity;
+  const autoWatched = parsed.data.totalDuration > 0 && remaining <= 10 ? 1 : 0;
+  const isWatched = parsed.data.isWatched === true ? 1 : autoWatched;
+  const needsTranscode = parsed.data.needsTranscode === true ? 1 : 0;
+
+  db.prepare(`
+    INSERT INTO watch_progress(user_id, account_id, type, item_id, series_id, season_number, episode_number, current_time, total_duration, is_watched, needs_transcode, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_id, account_id, type, item_id) DO UPDATE SET
+      current_time = excluded.current_time,
+      total_duration = CASE
+        WHEN excluded.total_duration > 0 THEN excluded.total_duration
+        ELSE watch_progress.total_duration
+      END,
+      is_watched = MAX(watch_progress.is_watched, excluded.is_watched),
+      needs_transcode = MAX(watch_progress.needs_transcode, excluded.needs_transcode),
+      series_id = COALESCE(excluded.series_id, watch_progress.series_id),
+      season_number = COALESCE(excluded.season_number, watch_progress.season_number),
+      episode_number = COALESCE(excluded.episode_number, watch_progress.episode_number),
+      updated_at = excluded.updated_at
+  `).run(
+    request.user.userId,
+    parsed.data.accountId,
+    parsed.data.type,
+    parsed.data.itemId,
+    parsed.data.seriesId ?? null,
+    parsed.data.seasonNumber ?? null,
+    parsed.data.episodeNumber ?? null,
+    parsed.data.currentTime,
+    parsed.data.totalDuration,
+    isWatched,
+    needsTranscode,
+    nowEpoch()
+  );
+
+  return { ok: true };
+});
+
+app.get('/api/progress', { preHandler: [app.authenticate] }, async (request: any, reply) => {
+  const querySchema = z.object({
+    accountId: z.coerce.number().int().positive(),
+    type: z.enum(['vod', 'series_episode']),
+    itemIds: z.string().optional(),
+  });
+
+  const parsed = querySchema.safeParse(request.query);
+  if (!parsed.success) {
+    return reply.code(400).send({ message: 'Invalid query' });
+  }
+
+  const account = db
+    .prepare('SELECT id FROM iptv_accounts WHERE id = ? AND user_id = ?')
+    .get(parsed.data.accountId, request.user.userId) as { id: number } | undefined;
+
+  if (!account) {
+    return reply.code(404).send({ message: 'Account not found' });
+  }
+
+  const itemIds = parsed.data.itemIds
+    ? parsed.data.itemIds.split(',').map((id) => id.trim()).filter(Boolean).slice(0, 200)
+    : [];
+
+  if (itemIds.length === 0) {
+    return { items: [] };
+  }
+
+  const placeholders = itemIds.map(() => '?').join(',');
+  const rows = db
+    .prepare(
+      `SELECT item_id, current_time, total_duration, is_watched, needs_transcode, updated_at
+       FROM watch_progress
+       WHERE user_id = ? AND account_id = ? AND type = ? AND item_id IN (${placeholders})`
+    )
+    .all(request.user.userId, parsed.data.accountId, parsed.data.type, ...itemIds) as Array<{
+      item_id: string;
+      current_time: number;
+      total_duration: number;
+      is_watched: number;
+      needs_transcode: number;
+      updated_at: number;
+    }>;
+
+  return {
+    items: rows.map((row) => ({
+      itemId: row.item_id,
+      currentTime: row.current_time,
+      totalDuration: row.total_duration,
+      isWatched: row.is_watched === 1,
+      needsTranscode: row.needs_transcode === 1,
+      updatedAt: row.updated_at,
+    })),
+  };
+});
+
+app.get('/api/progress/series', { preHandler: [app.authenticate] }, async (request: any, reply) => {
+  const querySchema = z.object({
+    accountId: z.coerce.number().int().positive(),
+    seriesId: z.string().min(1),
+  });
+
+  const parsed = querySchema.safeParse(request.query);
+  if (!parsed.success) {
+    return reply.code(400).send({ message: 'Invalid query' });
+  }
+
+  const account = db
+    .prepare('SELECT id FROM iptv_accounts WHERE id = ? AND user_id = ?')
+    .get(parsed.data.accountId, request.user.userId) as { id: number } | undefined;
+
+  if (!account) {
+    return reply.code(404).send({ message: 'Account not found' });
+  }
+
+  const rows = db
+    .prepare(
+      `SELECT item_id, current_time, total_duration, is_watched, needs_transcode, season_number, episode_number, updated_at
+       FROM watch_progress
+       WHERE user_id = ? AND account_id = ? AND series_id = ?
+       ORDER BY updated_at DESC`
+    )
+    .all(request.user.userId, parsed.data.accountId, parsed.data.seriesId) as Array<{
+      item_id: string;
+      current_time: number;
+      total_duration: number;
+      is_watched: number;
+      needs_transcode: number;
+      season_number: number | null;
+      episode_number: number | null;
+      updated_at: number;
+    }>;
+
+  if (rows.length === 0) {
+    return { lastEpisode: null, watchedEpisodeIds: [] };
+  }
+
+  const lastRow = rows[0];
+  const watchedEpisodeIds = rows.filter((row) => row.is_watched === 1).map((row) => row.item_id);
+
+  return {
+    lastEpisode: {
+      episodeId: lastRow.item_id,
+      seasonNumber: lastRow.season_number,
+      episodeNumber: lastRow.episode_number,
+      currentTime: lastRow.current_time,
+      totalDuration: lastRow.total_duration,
+      isWatched: lastRow.is_watched === 1,
+      needsTranscode: lastRow.needs_transcode === 1,
+    },
+    watchedEpisodeIds,
+  };
+});
+
+app.delete('/api/progress', { preHandler: [app.authenticate] }, async (request: any, reply) => {
+  const bodySchema = z.object({
+    accountId: z.coerce.number().int().positive(),
+    type: z.enum(['vod', 'series_episode']),
+    itemId: z.string().min(1),
+  });
+
+  const parsed = bodySchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ message: 'Invalid payload' });
+  }
+
+  const account = db
+    .prepare('SELECT id FROM iptv_accounts WHERE id = ? AND user_id = ?')
+    .get(parsed.data.accountId, request.user.userId) as { id: number } | undefined;
+
+  if (!account) {
+    return reply.code(404).send({ message: 'Account not found' });
+  }
+
+  db.prepare(
+    'DELETE FROM watch_progress WHERE user_id = ? AND account_id = ? AND type = ? AND item_id = ?'
+  ).run(request.user.userId, parsed.data.accountId, parsed.data.type, parsed.data.itemId);
+
+  return { ok: true };
+});
+
+app.delete('/api/progress/clear', { preHandler: [app.authenticate] }, async (request: any, reply) => {
+  const querySchema = z.object({
+    accountId: z.coerce.number().int().positive(),
+  });
+
+  const parsed = querySchema.safeParse(request.query);
+  if (!parsed.success) {
+    return reply.code(400).send({ message: 'Invalid query' });
+  }
+
+  // Verify user owns this account
+  const account = db
+    .prepare('SELECT id FROM iptv_accounts WHERE id = ? AND user_id = ?')
+    .get(parsed.data.accountId, request.user.userId) as { id: number } | undefined;
+
+  if (!account) {
+    return reply.code(404).send({ message: 'Account not found' });
+  }
+
+  // Delete all watch progress for this account
+  db.prepare(
+    'DELETE FROM watch_progress WHERE user_id = ? AND account_id = ?'
+  ).run(request.user.userId, parsed.data.accountId);
+
+  return { ok: true };
+});
+
+// ── User Preferences ─────────────────────────────────────────────────────────
+
+app.get('/api/preferences', { preHandler: [app.authenticate] }, async (request: any) => {
+  const row = db
+    .prepare('SELECT autoplay, language FROM user_preferences WHERE user_id = ?')
+    .get(request.user.userId) as { autoplay: number; language: string } | undefined;
+
+  return {
+    autoplay: row ? row.autoplay === 1 : true,
+    language: row?.language ?? 'fr',
+  };
+});
+
+app.put('/api/preferences', { preHandler: [app.authenticate] }, async (request: any, reply) => {
+  const bodySchema = z.object({
+    autoplay: z.boolean().optional(),
+    language: z.string().min(2).max(5).optional(),
+  });
+
+  const parsed = bodySchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ message: 'Invalid payload' });
+  }
+
+  const existing = db
+    .prepare('SELECT autoplay, language FROM user_preferences WHERE user_id = ?')
+    .get(request.user.userId) as { autoplay: number; language: string } | undefined;
+
+  const autoplay =
+    parsed.data.autoplay !== undefined
+      ? parsed.data.autoplay ? 1 : 0
+      : (existing?.autoplay ?? 1);
+  const language = parsed.data.language ?? existing?.language ?? 'fr';
+
+  db.prepare(`
+    INSERT INTO user_preferences(user_id, autoplay, language, updated_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+      autoplay = excluded.autoplay,
+      language = excluded.language,
+      updated_at = excluded.updated_at
+  `).run(request.user.userId, autoplay, language, nowEpoch());
+
+  return { ok: true };
+});
+
+// ── IPTV ─────────────────────────────────────────────────────────────────────
+
 app.get('/api/iptv/categories', { preHandler: [app.authenticate] }, async (request: any, reply) => {
   const querySchema = z.object({
     accountId: z.coerce.number().int().positive(),
@@ -612,6 +937,8 @@ app.get('/api/iptv/content', { preHandler: [app.authenticate] }, async (request:
       String(entry.tv_archive ?? '0') === '1' || Number(entry.tv_archive_duration ?? 0) > 0,
     archiveDurationHours: Number(entry.tv_archive_duration ?? 0) || null,
     rating: entry.rating ?? null,
+    duration: entry.duration ?? null,
+    durationSeconds: Number(entry.duration_secs ?? 0) > 0 ? Number(entry.duration_secs) : null,
     containerExtension: entry.container_extension ?? null,
     streamId: entry.stream_id ?? null,
     seriesId: entry.series_id ?? null,
@@ -859,17 +1186,64 @@ app.get('/api/iptv/stream-proxy', async (request: any, reply) => {
     ...(includeRange && incomingRange ? { Range: String(incomingRange) } : {}),
   });
 
-  let upstream = await fetch(sourceUrl, {
-    headers: buildHeaders(true),
-  });
+  const fetchWithTimeout = async (includeRange: boolean) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), env.streamProxyTimeoutMs);
+    try {
+      return await fetch(sourceUrl, {
+        headers: buildHeaders(includeRange),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  let upstream: Response;
+  try {
+    upstream = await fetchWithTimeout(true);
+  } catch (error: any) {
+    const note = error?.name === 'AbortError' ? 'proxy_timeout' : 'proxy_network_error';
+    logPlaybackTrace({
+      route: 'stream-proxy',
+      mode: 'proxy',
+      accountId: parsed.data.accountId,
+      mediaType: parsed.data.type,
+      streamId: parsed.data.streamId,
+      extension,
+      mediaTitle: parsed.data.mediaTitle,
+      seriesTitle: parsed.data.seriesTitle,
+      seasonNumber: parsed.data.seasonNumber,
+      episodeNumber: parsed.data.episodeNumber,
+      note,
+    });
+    return reply.code(504).send({ message: 'Upstream stream timeout' });
+  }
 
   let fallbackWithoutRange = false;
 
   if ((upstream.status === 405 || upstream.status === 416) && incomingRange) {
     fallbackWithoutRange = true;
-    upstream = await fetch(sourceUrl, {
-      headers: buildHeaders(false),
-    });
+    try {
+      upstream = await fetchWithTimeout(false);
+    } catch (error: any) {
+      const note = error?.name === 'AbortError' ? 'proxy_timeout_after_range_fallback' : 'proxy_network_error_after_range_fallback';
+      logPlaybackTrace({
+        route: 'stream-proxy',
+        mode: 'proxy',
+        accountId: parsed.data.accountId,
+        mediaType: parsed.data.type,
+        streamId: parsed.data.streamId,
+        extension,
+        mediaTitle: parsed.data.mediaTitle,
+        seriesTitle: parsed.data.seriesTitle,
+        seasonNumber: parsed.data.seasonNumber,
+        episodeNumber: parsed.data.episodeNumber,
+        fallbackWithoutRange,
+        note,
+      });
+      return reply.code(504).send({ message: 'Upstream stream timeout' });
+    }
   }
 
   logPlaybackTrace({
@@ -976,12 +1350,84 @@ app.get('/api/iptv/replay-url', { preHandler: [app.authenticate] }, async (reque
   return { url };
 });
 
+// Helper: Parse HTTP Range header (e.g., "bytes=1000-2000", "bytes=1000-", "bytes=-500")
+function parseRangeHeader(rangeHeader: string | undefined, totalBytes: number): { start: number; end: number } | null {
+  if (!rangeHeader || !rangeHeader.startsWith('bytes=')) return null;
+
+  const rangePart = rangeHeader.slice(6).trim();
+  if (!rangePart || rangePart.includes(',')) return null;
+
+  const parts = rangePart.split('-');
+  if (parts.length !== 2) return null;
+
+  const startRaw = parts[0].trim();
+  const endRaw = parts[1].trim();
+
+  let start = 0;
+  let end = totalBytes - 1;
+
+  if (startRaw === '' && endRaw === '') return null;
+
+  if (startRaw === '') {
+    const suffixLength = Number.parseInt(endRaw, 10);
+    if (!Number.isFinite(suffixLength) || suffixLength <= 0) return null;
+    start = Math.max(0, totalBytes - suffixLength);
+    end = totalBytes - 1;
+  } else {
+    start = Number.parseInt(startRaw, 10);
+    if (!Number.isFinite(start) || start < 0 || start >= totalBytes) return null;
+
+    if (endRaw !== '') {
+      const parsedEnd = Number.parseInt(endRaw, 10);
+      if (!Number.isFinite(parsedEnd) || parsedEnd < start) return null;
+      end = Math.min(parsedEnd, totalBytes - 1);
+    }
+  }
+
+  if (start > end) return null;
+  return { start, end };
+}
+
+// Helper: Get duration in seconds from an FFmpeg-accessible source
+async function getStreamDuration(sourceUrl: string): Promise<number | null> {
+  return new Promise((resolve) => {
+    const ffprobe = spawn('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1:noprint_names=1', sourceUrl]);
+
+    let output = '';
+    ffprobe.stdout.on('data', (chunk) => {
+      output += chunk.toString();
+    });
+
+    ffprobe.on('close', () => {
+      try {
+        const duration = parseFloat(output.trim());
+        resolve(isNaN(duration) ? null : duration);
+      } catch {
+        resolve(null);
+      }
+    });
+
+    ffprobe.on('error', () => {
+      resolve(null);
+    });
+
+    setTimeout(() => {
+      if (!ffprobe.killed) {
+        ffprobe.kill('SIGKILL');
+        resolve(null);
+      }
+    }, 5000); // 5 second timeout
+  });
+}
+
 app.get('/api/iptv/transcode', async (request: any, reply) => {
   const querySchema = z.object({
     token: z.string().min(10),
     accountId: z.coerce.number().int().positive(),
     type: z.enum(['live', 'vod', 'series']),
     streamId: z.coerce.number().int().positive(),
+    seekSeconds: z.coerce.number().min(0).optional(),
+    durationSeconds: z.coerce.number().min(1).optional(),
     containerExtension: z.string().min(2).max(8).optional().default('mkv'),
     mediaTitle: z.string().max(180).optional(),
     seriesTitle: z.string().max(180).optional(),
@@ -1019,6 +1465,60 @@ app.get('/api/iptv/transcode', async (request: any, reply) => {
   const password = decryptSecret(account.password_enc);
   const pathType = parsed.data.type === 'live' ? 'live' : parsed.data.type === 'vod' ? 'movie' : 'series';
   const sourceUrl = `${normalizeServerUrl(account.server_url)}/${pathType}/${account.username}/${password}/${parsed.data.streamId}.${parsed.data.containerExtension}`;
+  
+  // Handle Range requests for seeking in transcoded video
+  let seekSeconds = typeof parsed.data.seekSeconds === 'number' && Number.isFinite(parsed.data.seekSeconds)
+    ? Math.max(0, parsed.data.seekSeconds)
+    : 0;
+
+  let isRangeRequest = false;
+  let contentRangeHeader: string | undefined;
+  let responseStatusCode = 200;
+
+  const rangeHeader = request.headers.range;
+  if (rangeHeader && typeof rangeHeader === 'string') {
+    // Try to use provided duration or fetch it
+    let durationSeconds: number | null | undefined = parsed.data.durationSeconds;
+    
+    if (!durationSeconds) {
+      // Fallback: try to fetch duration using ffprobe (with timeout)
+      durationSeconds = await getStreamDuration(sourceUrl);
+    }
+
+    if (durationSeconds && durationSeconds > 0) {
+      // Estimate file size using a conservative default transcode bitrate budget.
+      const estimatedBitrateBitsPerSecond = 4_000_000; // 4 Mbps
+      const estimatedTotalBytes = Math.max(1, Math.floor((durationSeconds * estimatedBitrateBitsPerSecond) / 8));
+
+      const range = parseRangeHeader(rangeHeader, estimatedTotalBytes);
+      if (range) {
+        isRangeRequest = true;
+        responseStatusCode = 206;
+
+        // Map byte range to time range
+        const bytesPerSecond = Math.max(1, estimatedTotalBytes / durationSeconds);
+        const startSeconds = Math.floor(range.start / bytesPerSecond);
+        const endSeconds = Math.floor(range.end / bytesPerSecond);
+
+        seekSeconds = startSeconds;
+        contentRangeHeader = `bytes ${range.start}-${range.end}/${estimatedTotalBytes}`;
+
+        logPlaybackTrace({
+          route: 'transcode',
+          mode: 'transcode',
+          accountId: parsed.data.accountId,
+          mediaType: parsed.data.type,
+          streamId: parsed.data.streamId,
+          extension: parsed.data.containerExtension,
+          mediaTitle: parsed.data.mediaTitle,
+          seriesTitle: parsed.data.seriesTitle,
+          seasonNumber: parsed.data.seasonNumber,
+          episodeNumber: parsed.data.episodeNumber,
+          note: `range_request_${range.start}-${range.end}_seek_${startSeconds}-${endSeconds}s`,
+        });
+      }
+    }
+  }
 
   const ffmpegArgs = [
     '-hide_banner',
@@ -1026,6 +1526,26 @@ app.get('/api/iptv/transcode', async (request: any, reply) => {
     'error',
     '-fflags',
     '+genpts',
+  ];
+
+  if (/^https?:\/\//i.test(sourceUrl)) {
+    ffmpegArgs.push(
+      '-reconnect',
+      '1',
+      '-reconnect_streamed',
+      '1',
+      '-reconnect_delay_max',
+      '5',
+      '-rw_timeout',
+      '15000000',
+    );
+  }
+
+  if (seekSeconds > 0) {
+    ffmpegArgs.push('-ss', seekSeconds.toFixed(3));
+  }
+
+  ffmpegArgs.push(
     '-i',
     sourceUrl,
     '-map',
@@ -1051,7 +1571,7 @@ app.get('/api/iptv/transcode', async (request: any, reply) => {
     '-f',
     'mp4',
     'pipe:1',
-  ];
+  );
 
   const ffmpeg = spawn('ffmpeg', ffmpegArgs, {
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -1068,7 +1588,7 @@ app.get('/api/iptv/transcode', async (request: any, reply) => {
     seriesTitle: parsed.data.seriesTitle,
     seasonNumber: parsed.data.seasonNumber,
     episodeNumber: parsed.data.episodeNumber,
-    note: 'ffmpeg_start',
+    note: seekSeconds > 0 ? `ffmpeg_start_seek_${seekSeconds.toFixed(3)}` : 'ffmpeg_start',
   });
 
   let started = false;
@@ -1127,9 +1647,13 @@ app.get('/api/iptv/transcode', async (request: any, reply) => {
   });
 
   reply.hijack();
-  reply.raw.statusCode = 200;
+  reply.raw.statusCode = responseStatusCode;
   reply.raw.setHeader('Content-Type', 'video/mp4');
+  reply.raw.setHeader('Accept-Ranges', 'bytes');
   reply.raw.setHeader('Cache-Control', 'no-store');
+  if (contentRangeHeader) {
+    reply.raw.setHeader('Content-Range', contentRangeHeader);
+  }
   ffmpeg.stdout.pipe(reply.raw);
 });
 

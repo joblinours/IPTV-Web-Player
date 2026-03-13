@@ -39,6 +39,8 @@ export interface ContentItem {
   seasonsCount?: number | null;
   episodesCount?: number | null;
   rating: string | null;
+  duration?: string | null;
+  durationSeconds?: number | null;
   containerExtension?: string | null;
   streamId: number | null;
   seriesId: number | null;
@@ -123,21 +125,40 @@ function sectionToBackendType(section: SectionType): BackendType {
 }
 
 async function request<T>(path: string, options: RequestInit = {}, token?: string): Promise<T> {
+  const headers = new Headers(options.headers ?? {});
+  const hasBody = options.body !== undefined && options.body !== null;
+
+  if (hasBody && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json');
+  }
+
+  if (token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(options.headers ?? {}),
-    },
+    headers,
   });
 
   if (!response.ok) {
-    const body = await response.json().catch(() => ({}));
-    throw new Error(body.message ?? 'Request failed');
+    const body = await response.json().catch(() => null);
+    if (body && typeof body.message === 'string' && body.message.length > 0) {
+      throw new Error(body.message);
+    }
+    throw new Error(`Request failed (${response.status})`);
   }
 
-  return response.json() as Promise<T>;
+  if (response.status === 204) {
+    return {} as T;
+  }
+
+  const contentType = response.headers.get('content-type') ?? '';
+  if (contentType.includes('application/json')) {
+    return response.json() as Promise<T>;
+  }
+
+  return (await response.text()) as T;
 }
 
 export async function register(payload: LoginPayload) {
@@ -300,6 +321,7 @@ export function buildTranscodeUrl(params: {
   section: SectionType;
   streamId: number;
   containerExtension?: string;
+  durationSeconds?: number;
   debugContext?: PlaybackDebugContext;
 }) {
   const type = sectionToBackendType(params.section);
@@ -315,6 +337,7 @@ export function buildTranscodeUrl(params: {
   if (params.debugContext?.seriesTitle) query.set('seriesTitle', params.debugContext.seriesTitle);
   if (typeof params.debugContext?.seasonNumber === 'number') query.set('seasonNumber', String(params.debugContext.seasonNumber));
   if (typeof params.debugContext?.episodeNumber === 'number') query.set('episodeNumber', String(params.debugContext.episodeNumber));
+  if (typeof params.durationSeconds === 'number' && params.durationSeconds > 0) query.set('durationSeconds', String(Math.floor(params.durationSeconds)));
 
   return `${API_BASE_URL}/api/iptv/transcode?${query.toString()}`;
 }
@@ -342,4 +365,110 @@ export function buildStreamProxyUrl(params: {
   if (typeof params.debugContext?.episodeNumber === 'number') query.set('episodeNumber', String(params.debugContext.episodeNumber));
 
   return `${API_BASE_URL}/api/iptv/stream-proxy?${query.toString()}`;
+}
+
+// ── Watch Progress ────────────────────────────────────────────────────────────
+
+export interface ProgressEntry {
+  itemId: string;
+  currentTime: number;
+  totalDuration: number;
+  isWatched: boolean;
+  needsTranscode: boolean;
+  updatedAt: number;
+}
+
+export interface SeriesProgressSummary {
+  lastEpisode: {
+    episodeId: string;
+    seasonNumber: number | null;
+    episodeNumber: number | null;
+    currentTime: number;
+    totalDuration: number;
+    isWatched: boolean;
+    needsTranscode: boolean;
+  } | null;
+  watchedEpisodeIds: string[];
+}
+
+export interface UserPreferences {
+  autoplay: boolean;
+  language: string;
+}
+
+export async function fetchProgress(
+  token: string,
+  accountId: number,
+  type: 'vod' | 'series_episode',
+  itemIds: string[]
+): Promise<{ items: ProgressEntry[] }> {
+  const query = new URLSearchParams({
+    accountId: String(accountId),
+    type,
+    itemIds: itemIds.join(','),
+  });
+  return request<{ items: ProgressEntry[] }>(`/api/progress?${query.toString()}`, { method: 'GET' }, token);
+}
+
+export async function fetchSeriesProgress(
+  token: string,
+  accountId: number,
+  seriesId: string
+): Promise<SeriesProgressSummary> {
+  const query = new URLSearchParams({ accountId: String(accountId), seriesId });
+  return request<SeriesProgressSummary>(`/api/progress/series?${query.toString()}`, { method: 'GET' }, token);
+}
+
+export async function updateProgress(
+  token: string,
+  params: {
+    accountId: number;
+    type: 'vod' | 'series_episode';
+    itemId: string;
+    seriesId?: string;
+    seasonNumber?: number;
+    episodeNumber?: number;
+    currentTime: number;
+    totalDuration: number;
+    isWatched?: boolean;
+    needsTranscode?: boolean;
+  }
+) {
+  return request<{ ok: boolean }>(
+    '/api/progress',
+    { method: 'POST', body: JSON.stringify(params) },
+    token
+  );
+}
+
+export async function clearProgress(
+  token: string,
+  params: { accountId: number; type: 'vod' | 'series_episode'; itemId: string }
+) {
+  return request<{ ok: boolean }>(
+    '/api/progress',
+    { method: 'DELETE', body: JSON.stringify(params) },
+    token
+  );
+}
+
+export async function clearWatchHistory(token: string, accountId: number) {
+  const query = new URLSearchParams({ accountId: String(accountId) });
+  return request<{ ok: boolean }>(
+    `/api/progress/clear?${query.toString()}`,
+    { method: 'DELETE' },
+    token
+  );
+}
+
+export async function fetchPreferences(token: string): Promise<UserPreferences> {
+  return request<UserPreferences>('/api/preferences', { method: 'GET' }, token);
+}
+
+export async function updatePreferences(token: string, prefs: Partial<UserPreferences>) {
+  return request<{ ok: boolean }>(
+    '/api/preferences',
+    { method: 'PUT', body: JSON.stringify(prefs) },
+    token
+  );
 }

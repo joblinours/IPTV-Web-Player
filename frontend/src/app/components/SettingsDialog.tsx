@@ -1,8 +1,17 @@
 import { useState } from 'react';
 import { motion } from 'motion/react';
-import { Shield, Volume2, Globe } from 'lucide-react';
+import { Shield, Volume2, Globe, Trash2 } from 'lucide-react';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from './ui/dialog';
-import type { IptvAccount } from '../lib/api';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from './ui/alert-dialog';
+import type { IptvAccount, UserPreferences } from '../lib/api';
 
 interface SettingsDialogProps {
     open: boolean;
@@ -11,14 +20,47 @@ interface SettingsDialogProps {
     activeAccountId?: number | null;
     onSwitchAccount?: (accountId: number) => void;
     onAddAccount?: () => void;
+    preferences?: UserPreferences;
+    onUpdatePreferences?: (prefs: Partial<UserPreferences>) => void;
+    onClearWatchHistory?: () => void;
 }
 
-export function SettingsDialog({ open, onOpenChange, accounts = [], activeAccountId = null, onSwitchAccount, onAddAccount }: SettingsDialogProps) {
-    const [language, setLanguage] = useState('fr');
-    const [autoplay, setAutoplay] = useState(true);
+export function SettingsDialog({
+    open,
+    onOpenChange,
+    accounts = [],
+    activeAccountId = null,
+    onSwitchAccount,
+    onAddAccount,
+    preferences,
+    onUpdatePreferences,
+    onClearWatchHistory,
+}: SettingsDialogProps) {
+    const language = preferences?.language ?? 'fr';
+    const autoplay = preferences?.autoplay ?? true;
+    const [showClearConfirmation, setShowClearConfirmation] = useState(false);
+    const [isClearing, setIsClearing] = useState(false);
+    const [clearError, setClearError] = useState<string | null>(null);
+
+    const handleClearHistoryConfirm = async () => {
+        setIsClearing(true);
+        setClearError(null);
+        try {
+            await onClearWatchHistory?.();
+            setShowClearConfirmation(false);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Erreur lors de la suppression';
+            setClearError(message);
+        } finally {
+            setIsClearing(false);
+        }
+    };
+
+    const activeAccount = accounts.find(acc => acc.id === activeAccountId);
 
     return (
-        <Dialog open={open} onOpenChange={onOpenChange}>
+        <>
+            <Dialog open={open} onOpenChange={onOpenChange}>
             <DialogContent className="bg-gray-900/95 backdrop-blur-xl border border-white/10 text-white max-w-2xl max-h-[85vh] overflow-y-auto">
                 <DialogHeader>
                     <DialogTitle className="text-2xl font-bold bg-gradient-to-r from-red-500 to-orange-500 bg-clip-text text-transparent">
@@ -78,7 +120,7 @@ export function SettingsDialog({ open, onOpenChange, accounts = [], activeAccoun
                         </div>
                         <select
                             value={language}
-                            onChange={(e) => setLanguage(e.target.value)}
+                            onChange={(e) => onUpdatePreferences?.({ language: e.target.value })}
                             className="w-full px-4 py-3 bg-white/5 border border-white/10 rounded-xl text-white focus:outline-none focus:border-red-500/50 focus:ring-2 focus:ring-red-500/20"
                         >
                             <option value="fr">Français</option>
@@ -101,7 +143,7 @@ export function SettingsDialog({ open, onOpenChange, accounts = [], activeAccoun
                                 <input
                                     type="checkbox"
                                     checked={autoplay}
-                                    onChange={(e) => setAutoplay(e.target.checked)}
+                                    onChange={(e) => onUpdatePreferences?.({ autoplay: e.target.checked })}
                                     className="sr-only peer"
                                 />
                                 <div className="w-14 h-7 bg-white/10 peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-red-500/20 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-0.5 after:start-[4px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-6 after:w-6 after:transition-all peer-checked:bg-gradient-to-r peer-checked:from-red-600 peer-checked:to-orange-600"></div>
@@ -120,7 +162,11 @@ export function SettingsDialog({ open, onOpenChange, accounts = [], activeAccoun
                             </div>
                         </div>
                         <div className="space-y-2">
-                            <button className="w-full px-4 py-2 bg-white/5 border border-white/10 rounded-lg hover:bg-white/10 transition-colors text-left">
+                            <button 
+                                onClick={() => setShowClearConfirmation(true)}
+                                className="w-full px-4 py-2 bg-red-600/10 border border-red-500/20 rounded-lg hover:bg-red-600/20 transition-colors text-left flex items-center gap-2 text-red-300"
+                            >
+                                <Trash2 size={16} />
                                 Effacer l'historique de visionnage
                             </button>
                             <button className="w-full px-4 py-2 bg-white/5 border border-white/10 rounded-lg hover:bg-white/10 transition-colors text-left">
@@ -150,5 +196,38 @@ export function SettingsDialog({ open, onOpenChange, accounts = [], activeAccoun
                 </div>
             </DialogContent>
         </Dialog>
+
+        <AlertDialog open={showClearConfirmation} onOpenChange={setShowClearConfirmation}>
+            <AlertDialogContent className="bg-gray-900/95 backdrop-blur-xl border border-white/10 text-white">
+                <AlertDialogHeader>
+                    <AlertDialogTitle className="text-red-400">
+                        Effacer l'historique de visionnage ?
+                    </AlertDialogTitle>
+                    <AlertDialogDescription className="text-gray-300">
+                        Cette action supprimera toutes les données de lecture pour le compte {activeAccount?.name ? `"${activeAccount.name}"` : 'sélectionné'}. 
+                        Cette action ne peut pas être annulée.
+                    </AlertDialogDescription>
+                </AlertDialogHeader>
+                <div className="flex gap-3 justify-end">
+                    <AlertDialogCancel 
+                        className="bg-white/5 border-white/10 text-white hover:bg-white/10"
+                        disabled={isClearing}
+                    >
+                        Annuler
+                    </AlertDialogCancel>
+                    <AlertDialogAction 
+                        className="bg-red-600 hover:bg-red-700 text-white"
+                        onClick={handleClearHistoryConfirm}
+                        disabled={isClearing}
+                    >
+                        {isClearing ? 'Suppression...' : 'Supprimer'}
+                    </AlertDialogAction>
+                </div>
+                {clearError && (
+                    <p className="mt-2 text-sm text-red-300">{clearError}</p>
+                )}
+            </AlertDialogContent>
+        </AlertDialog>
+        </>
     );
 }

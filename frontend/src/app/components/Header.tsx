@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Search, Settings, LogOut, X, Menu, Sun, Moon } from 'lucide-react';
 import { SettingsDialog } from './SettingsDialog';
-import type { IptvAccount } from '../lib/api';
+import type { IptvAccount, UserPreferences } from '../lib/api';
 
 interface HeaderProps {
   activeSection: 'live' | 'films' | 'series';
@@ -16,6 +16,9 @@ interface HeaderProps {
   activeAccountId?: number | null;
   onSwitchAccount?: (accountId: number) => void;
   onAddAccount?: () => void;
+  preferences?: UserPreferences;
+  onUpdatePreferences?: (prefs: Partial<UserPreferences>) => void;
+  onClearWatchHistory?: () => void;
 }
 
 export function Header({
@@ -30,6 +33,9 @@ export function Header({
   activeAccountId,
   onSwitchAccount,
   onAddAccount,
+  preferences,
+  onUpdatePreferences,
+  onClearWatchHistory,
 }: HeaderProps) {
   const [searchOpen, setSearchOpen] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -266,6 +272,9 @@ export function Header({
         activeAccountId={activeAccountId}
         onSwitchAccount={onSwitchAccount}
         onAddAccount={onAddAccount}
+        preferences={preferences}
+        onUpdatePreferences={onUpdatePreferences}
+        onClearWatchHistory={onClearWatchHistory}
       />
     </>
   );
