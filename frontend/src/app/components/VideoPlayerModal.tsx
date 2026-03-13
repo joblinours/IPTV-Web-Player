@@ -119,6 +119,7 @@ export function VideoPlayerModal({
     const transcodeSeekInFlightRef = useRef(false);
     const queuedTranscodeSeekRef = useRef<number | null>(null);
     const transcodeSeekUnlockTimerRef = useRef<number | null>(null);
+    const loadSourceRef = useRef<((url: string) => void) | null>(null);
 
     // ── Custom player UI state ───────────────────────────────────────────────
     const [isPlaying, setIsPlaying] = useState(false);
@@ -405,6 +406,8 @@ export function VideoPlayerModal({
             startWatchdog(url);
         };
 
+        loadSourceRef.current = loadSource;
+
         const refreshDuration = () => {
             const dur = resolveDuration();
             if (dur > 0 && Math.abs(dur - effectiveDurationRef.current) > 0.01) {
@@ -502,6 +505,7 @@ export function VideoPlayerModal({
 
         return () => {
             clearWatchdog();
+            loadSourceRef.current = null;
             if (transcodeSeekUnlockTimerRef.current !== null) {
                 window.clearTimeout(transcodeSeekUnlockTimerRef.current);
                 transcodeSeekUnlockTimerRef.current = null;
@@ -560,10 +564,14 @@ export function VideoPlayerModal({
             const seekUrl = withSeekSeconds(activeUrl, targetEffectiveTime);
             activeSourceUrlRef.current = seekUrl;
             seekOffsetRef.current = targetEffectiveTime;
-            v.pause();
-            v.src = seekUrl;
-            v.load();
-            v.play().catch(() => undefined);
+            if (loadSourceRef.current) {
+                loadSourceRef.current(seekUrl);
+            } else {
+                v.pause();
+                v.src = seekUrl;
+                v.load();
+                v.play().catch(() => undefined);
+            }
             setCurrentTimeSec(targetEffectiveTime);
             return;
         }
