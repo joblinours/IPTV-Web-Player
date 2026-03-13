@@ -131,6 +131,7 @@ export function VideoPlayerModal({
     // isDragging: pointer is held on the seek bar
     const [isDragging, setIsDragging] = useState(false);
     const seekBarRef = useRef<HTMLDivElement>(null);
+    const dragSeekRatioRef = useRef<number | null>(null);
 
     // ── Controls auto-hide ───────────────────────────────────────────────────
     const resetControlsTimeout = useCallback(() => {
@@ -481,7 +482,7 @@ export function VideoPlayerModal({
     }, [open, streamUrl, allSources, isLive]);
 
     // ── Seek bar interaction ─────────────────────────────────────────────────
-    const seekToRatio = (ratio: number) => {
+    const seekToRatio = (ratio: number, commit = true) => {
         const v = videoRef.current;
         if (!v || effectiveDuration <= 0) return;
         const clamped = Math.max(0, Math.min(1, ratio));
@@ -489,7 +490,12 @@ export function VideoPlayerModal({
         const activeUrl = activeSourceUrlRef.current ?? '';
         const isTranscodeSource = activeUrl.includes('/api/iptv/transcode');
 
-        if (isTranscodeSource && targetEffectiveTime + 0.25 < seekOffsetRef.current) {
+        if (isTranscodeSource) {
+            if (!commit) {
+                setCurrentTimeSec(targetEffectiveTime);
+                return;
+            }
+
             const seekUrl = withSeekSeconds(activeUrl, targetEffectiveTime);
             activeSourceUrlRef.current = seekUrl;
             seekOffsetRef.current = targetEffectiveTime;
@@ -516,15 +522,27 @@ export function VideoPlayerModal({
     const handleSeekBarMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
         if (isLive) return;
         e.preventDefault();
+        const ratio = ratioFromMouseEvent(e);
+        dragSeekRatioRef.current = ratio;
         setIsDragging(true);
-        seekToRatio(ratioFromMouseEvent(e));
+        seekToRatio(ratio, false);
         resetControlsTimeout();
     };
 
     useEffect(() => {
         if (!isDragging) return;
-        const onMove = (e: globalThis.MouseEvent) => seekToRatio(ratioFromMouseEvent(e));
-        const onUp = () => setIsDragging(false);
+        const onMove = (e: globalThis.MouseEvent) => {
+            const ratio = ratioFromMouseEvent(e);
+            dragSeekRatioRef.current = ratio;
+            seekToRatio(ratio, false);
+        };
+        const onUp = () => {
+            setIsDragging(false);
+            if (dragSeekRatioRef.current !== null) {
+                seekToRatio(dragSeekRatioRef.current, true);
+            }
+            dragSeekRatioRef.current = null;
+        };
         window.addEventListener('mousemove', onMove);
         window.addEventListener('mouseup', onUp);
         return () => {
@@ -548,6 +566,14 @@ export function VideoPlayerModal({
         if (isLive) return;
         const v = videoRef.current;
         if (!v) return;
+        const activeUrl = activeSourceUrlRef.current ?? '';
+        if (activeUrl.includes('/api/iptv/transcode') && effectiveDuration > 0) {
+            const currentEffective = v.currentTime + seekOffsetRef.current;
+            const target = Math.max(0, currentEffective + seconds);
+            seekToRatio(target / effectiveDuration, true);
+            resetControlsTimeout();
+            return;
+        }
         v.currentTime = Math.max(0, v.currentTime + seconds);
         resetControlsTimeout();
     };
