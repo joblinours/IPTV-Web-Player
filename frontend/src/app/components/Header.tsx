@@ -19,6 +19,9 @@ interface HeaderProps {
   preferences?: UserPreferences;
   onUpdatePreferences?: (prefs: Partial<UserPreferences>) => void;
   onClearWatchHistory?: () => void;
+  reducedMotion?: boolean;
+  onToggleReducedMotion?: (value: boolean) => void;
+  isWeakDevice?: boolean;
 }
 
 export function Header({
@@ -36,6 +39,9 @@ export function Header({
   preferences,
   onUpdatePreferences,
   onClearWatchHistory,
+  reducedMotion,
+  onToggleReducedMotion,
+  isWeakDevice,
 }: HeaderProps) {
   const [searchOpen, setSearchOpen] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -275,6 +281,9 @@ export function Header({
         preferences={preferences}
         onUpdatePreferences={onUpdatePreferences}
         onClearWatchHistory={onClearWatchHistory}
+        reducedMotion={reducedMotion}
+        onToggleReducedMotion={onToggleReducedMotion}
+        isWeakDevice={isWeakDevice}
       />
     </>
   );

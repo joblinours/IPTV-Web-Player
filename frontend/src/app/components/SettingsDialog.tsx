@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { motion } from 'motion/react';
-import { Shield, Volume2, Globe, Trash2 } from 'lucide-react';
+import { Shield, Volume2, Globe, Trash2, Gauge } from 'lucide-react';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from './ui/dialog';
 import {
   AlertDialog,
@@ -23,6 +23,9 @@ interface SettingsDialogProps {
     preferences?: UserPreferences;
     onUpdatePreferences?: (prefs: Partial<UserPreferences>) => void;
     onClearWatchHistory?: () => void;
+    reducedMotion?: boolean;
+    onToggleReducedMotion?: (value: boolean) => void;
+    isWeakDevice?: boolean;
 }
 
 export function SettingsDialog({
@@ -35,6 +38,9 @@ export function SettingsDialog({
     preferences,
     onUpdatePreferences,
     onClearWatchHistory,
+    reducedMotion = false,
+    onToggleReducedMotion,
+    isWeakDevice = false,
 }: SettingsDialogProps) {
     const language = preferences?.language ?? 'fr';
     const autoplay = preferences?.autoplay ?? true;
@@ -144,6 +150,31 @@ export function SettingsDialog({
                                     type="checkbox"
                                     checked={autoplay}
                                     onChange={(e) => onUpdatePreferences?.({ autoplay: e.target.checked })}
+                                    className="sr-only peer"
+                                />
+                                <div className="w-14 h-7 bg-white/10 peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-red-500/20 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-0.5 after:start-[4px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-6 after:w-6 after:transition-all peer-checked:bg-gradient-to-r peer-checked:from-red-600 peer-checked:to-orange-600"></div>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div className="space-y-3">
+                        <div className="flex items-center gap-3">
+                            <div className="p-2 bg-orange-600/20 rounded-lg">
+                                <Gauge size={20} className="text-orange-400" />
+                            </div>
+                            <div className="flex-1">
+                                <h3 className="font-semibold">Performance</h3>
+                                <p className="text-sm text-gray-400">
+                                    {isWeakDevice
+                                        ? 'Animations réduites automatiquement (TV/box détectée)'
+                                        : 'Réduire les animations pour plus de fluidité'}
+                                </p>
+                            </div>
+                            <label className="relative inline-flex items-center cursor-pointer">
+                                <input
+                                    type="checkbox"
+                                    checked={reducedMotion}
+                                    onChange={(e) => onToggleReducedMotion?.(e.target.checked)}
                                     className="sr-only peer"
                                 />
                                 <div className="w-14 h-7 bg-white/10 peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-red-500/20 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-0.5 after:start-[4px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-6 after:w-6 after:transition-all peer-checked:bg-gradient-to-r peer-checked:from-red-600 peer-checked:to-orange-600"></div>

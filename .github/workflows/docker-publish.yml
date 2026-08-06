@@ -6,6 +6,7 @@ on:
       - main
       - master
       - dev
+      - feature/movix-improvements
     tags:
       - "v*"
     paths:
@@ -60,9 +61,16 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/feature/movix-improvements' }}
+            type=ref,event=branch
             type=sha
             type=ref,event=tag
+
+      - name: Compute build metadata
+        id: build_meta
+        run: |
+          echo "commit=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "version=$(jq -r .version ${{ matrix.context }}/package.json)" >> "$GITHUB_OUTPUT"
 
       - name: Build and push image
         uses: docker/build-push-action@v6
@@ -70,7 +78,12 @@ jobs:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
           push: true
-          build-args: ${{ matrix.build_args }}
+          build-args: |
+            ${{ matrix.build_args }}
+            APP_VERSION=${{ matrix.service == 'backend' && steps.build_meta.outputs.version || '' }}
+            GIT_COMMIT=${{ matrix.service == 'backend' && steps.build_meta.outputs.commit || '' }}
+            VITE_APP_VERSION=${{ matrix.service == 'frontend' && steps.build_meta.outputs.version || '' }}
+            VITE_GIT_COMMIT=${{ matrix.service == 'frontend' && steps.build_meta.outputs.commit || '' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

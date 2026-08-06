@@ -1,17 +1,24 @@
 import { motion } from 'motion/react';
 import { Play, Info, Radio } from 'lucide-react';
 import { ImageWithFallback } from './figma/ImageWithFallback';
+import { useTmdbMatch } from '../hooks/useTmdbMatch';
 import type { ContentItem } from '../lib/api';
 
 interface HeroProps {
   type: 'live' | 'films' | 'series';
   isDarkMode: boolean;
   featuredItem?: ContentItem | null;
+  token?: string | null;
   onPlay?: () => void;
   onInfo?: () => void;
 }
 
-export function Hero({ type, isDarkMode, featuredItem, onPlay, onInfo }: HeroProps) {
+export function Hero({ type, isDarkMode, featuredItem, token, onPlay, onInfo }: HeroProps) {
+  // Best-effort enrichment: only the single featured item is looked up, so
+  // this never fans out into one TMDB request per catalog tile.
+  const tmdbType = type === 'films' ? 'movie' : type === 'series' ? 'series' : null;
+  const tmdbMatch = useTmdbMatch(token, featuredItem?.title, tmdbType, featuredItem?.year ?? undefined);
+
   const getHeroContent = () => {
     const fallbackTitle = type === 'live' ? 'Live' : type === 'films' ? 'Film' : 'Série';
     switch (type) {
@@ -25,18 +32,18 @@ export function Hero({ type, isDarkMode, featuredItem, onPlay, onInfo }: HeroPro
       case 'films':
         return {
           title: featuredItem?.title ?? fallbackTitle,
-          description: featuredItem?.description ?? 'Film disponible dans le catalogue.',
+          description: tmdbMatch?.overview ?? featuredItem?.description ?? 'Film disponible dans le catalogue.',
           badge: 'TENDANCE',
           duration: featuredItem?.year ?? '',
-          image: featuredItem?.poster ?? 'movie cinema thriller',
+          image: tmdbMatch?.backdropUrl ?? featuredItem?.poster ?? 'movie cinema thriller',
         };
       case 'series':
         return {
           title: featuredItem?.title ?? fallbackTitle,
-          description: featuredItem?.description ?? 'Série disponible dans le catalogue.',
+          description: tmdbMatch?.overview ?? featuredItem?.description ?? 'Série disponible dans le catalogue.',
           badge: 'POPULAIRE',
           seasons: featuredItem?.year ?? '',
-          image: featuredItem?.poster ?? 'tv series drama',
+          image: tmdbMatch?.backdropUrl ?? featuredItem?.poster ?? 'tv series drama',
         };
     }
   };

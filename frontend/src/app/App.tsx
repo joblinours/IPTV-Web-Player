@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { motion, AnimatePresence } from 'motion/react';
+import { motion, AnimatePresence, MotionConfig } from 'motion/react';
+import { usePerformanceMode } from './hooks/usePerformanceMode';
+import { useFavorites } from './hooks/useFavorites';
+import { usePreferences } from './hooks/usePreferences';
 import { Header } from './components/Header';
 import { Hero } from './components/Hero';
 import { CategoryTabs } from './components/CategoryTabs';
 import { LoginPage } from './components/LoginPage';
+import { AppFooter } from './components/AppFooter';
 import { IptvCredentialsDialog } from './components/IptvCredentialsDialog';
 import { PaginatedContentGrid } from './components/PaginatedContentGrid';
 import { VideoPlayerModal } from './components/VideoPlayerModal';
@@ -12,16 +16,13 @@ import { LiveRecordingsDialog } from './components/LiveRecordingsDialog';
 import { LiveScheduleDialog } from './components/LiveScheduleDialog';
 import {
     addIptvAccount,
-    addFavorite,
     clearWatchHistory,
     fetchCategories,
     fetchContentPage,
     fetchEpg,
-    fetchFavorites,
     fetchProgress,
     fetchSeriesInfo,
     fetchSeriesProgress,
-    fetchPreferences,
     fetchReplayUrl,
     fetchStreamUrl,
     buildStreamProxyUrl,
@@ -29,9 +30,7 @@ import {
     listIptvAccounts,
     login,
     register,
-    removeFavorite,
     updateProgress,
-    updatePreferences,
     type CategoryItem,
     type ContentItem,
     type EpgItem,
@@ -40,7 +39,6 @@ import {
     type SeriesEpisode,
     type SeriesInfoResponse,
     type SeriesProgressSummary,
-    type UserPreferences,
     type PlaybackDebugContext,
     type SectionType,
 } from './lib/api';
@@ -48,7 +46,6 @@ import {
 type CategoryMap = Record<SectionType, CategoryItem[]>;
 type SelectedCategoryMap = Record<SectionType, string>;
 type SeriesStatsMap = Record<number, { seasonsCount: number; episodesCount: number }>;
-type FavoriteIdMap = Record<SectionType, Set<string>>;
 type VodProgressMap = Record<string, ProgressEntry>;
 type SeriesProgressMap = Record<string, SeriesProgressSummary>;
 type EpisodeProgressMap = Record<string, { currentTime: number; totalDuration: number; isWatched: boolean; needsTranscode: boolean }>;
@@ -153,14 +150,6 @@ const defaultSelectedCategories: SelectedCategoryMap = {
     series: 'all',
 };
 
-function createDefaultFavoriteMap(): FavoriteIdMap {
-    return {
-        live: new Set<string>(),
-        films: new Set<string>(),
-        series: new Set<string>(),
-    };
-}
-
 function uniqueExtensions(extensions: string[]): string[] {
     const seen = new Set<string>();
     const output: string[] = [];
@@ -189,6 +178,7 @@ function toEpochSeconds(item: EpgItem, useStop: boolean): number | null {
 }
 
 export default function App() {
+    const { reducedMotion, setReducedMotion, isWeakDevice } = usePerformanceMode();
     const [token, setToken] = useState<string | null>(() => localStorage.getItem('iptv_token'));
     const [accounts, setAccounts] = useState<IptvAccount[]>([]);
     const [accountId, setAccountId] = useState<number | null>(null);
@@ -196,6 +186,14 @@ export default function App() {
     const [categoriesBySection, setCategoriesBySection] = useState<CategoryMap>(defaultCategories);
     const [selectedCategories, setSelectedCategories] = useState<SelectedCategoryMap>(defaultSelectedCategories);
     const [searchQuery, setSearchQuery] = useState('');
+    // The input stays bound to `searchQuery` for instant feedback; the catalog
+    // fetch effects below depend on this debounced copy instead, so typing
+    // doesn't fire one request per keystroke against large Xtream catalogs.
+    const [deferredSearchQuery, setDeferredSearchQuery] = useState('');
+    useEffect(() => {
+        const timer = setTimeout(() => setDeferredSearchQuery(searchQuery), 300);
+        return () => clearTimeout(timer);
+    }, [searchQuery]);
     const [isDarkMode, setIsDarkMode] = useState(true);
 
     const [items, setItems] = useState<ContentItem[]>([]);
@@ -219,7 +217,7 @@ export default function App() {
     const [seriesDetailData, setSeriesDetailData] = useState<SeriesInfoResponse | null>(null);
     const [seriesDetailLoading, setSeriesDetailLoading] = useState(false);
     const [seriesStatsMap, setSeriesStatsMap] = useState<SeriesStatsMap>({});
-    const [favoritesBySection, setFavoritesBySection] = useState<FavoriteIdMap>(() => createDefaultFavoriteMap());
+    const { favoritesBySection, toggleFavorite, resetFavorites } = useFavorites(token, accountId, activeSection);
 
     const [recordingsOpen, setRecordingsOpen] = useState(false);
     const [recordingsTitle, setRecordingsTitle] = useState('');
@@ -233,7 +231,7 @@ export default function App() {
     const [scheduleItems, setScheduleItems] = useState<EpgItem[]>([]);
 
     // ── Watch progress & preferences ─────────────────────────────────────────
-    const [preferences, setPreferences] = useState<UserPreferences>({ autoplay: true, language: 'fr' });
+    const { preferences, updatePreferences, resetPreferences } = usePreferences(token);
     const [vodProgressMap, setVodProgressMap] = useState<VodProgressMap>({});
     const [seriesProgressMap, setSeriesProgressMap] = useState<SeriesProgressMap>({});
     const [episodeProgressMap, setEpisodeProgressMap] = useState<EpisodeProgressMap>({});
@@ -341,37 +339,6 @@ export default function App() {
 
         let cancelled = false;
 
-        const loadFavorites = async () => {
-            try {
-                const result = await fetchFavorites(token, accountId, activeSection);
-                if (cancelled) return;
-
-                setFavoritesBySection((prev) => ({
-                    ...prev,
-                    [activeSection]: new Set(result.items),
-                }));
-            } catch {
-                if (!cancelled) {
-                    setFavoritesBySection((prev) => ({
-                        ...prev,
-                        [activeSection]: new Set<string>(),
-                    }));
-                }
-            }
-        };
-
-        loadFavorites();
-
-        return () => {
-            cancelled = true;
-        };
-    }, [token, accountId, activeSection]);
-
-    useEffect(() => {
-        if (!token || !accountId) return;
-
-        let cancelled = false;
-
         const loadFirstPage = async () => {
             setIsLoadingContent(true);
             try {
@@ -379,7 +346,7 @@ export default function App() {
                     accountId,
                     section: activeSection,
                     categoryId: currentCategory,
-                    searchQuery,
+                    searchQuery: deferredSearchQuery,
                     offset: 0,
                     limit: PAGE_SIZE,
                 });
@@ -407,15 +374,7 @@ export default function App() {
         return () => {
             cancelled = true;
         };
-    }, [token, accountId, activeSection, currentCategory, searchQuery]);
-
-    // Load user preferences when authenticated
-    useEffect(() => {
-        if (!token) return;
-        fetchPreferences(token)
-            .then((prefs) => setPreferences(prefs))
-            .catch(() => {});
-    }, [token]);
+    }, [token, accountId, activeSection, currentCategory, deferredSearchQuery]);
 
     // Prefetch series stats (seasons/episodes count)
     useEffect(() => {
@@ -518,7 +477,7 @@ export default function App() {
                 accountId,
                 section: activeSection,
                 categoryId: currentCategory,
-                searchQuery,
+                searchQuery: deferredSearchQuery,
                 offset: nextOffset,
                 limit: PAGE_SIZE,
             });
@@ -529,7 +488,7 @@ export default function App() {
         } finally {
             setIsLoadingContent(false);
         }
-    }, [token, accountId, isLoadingContent, hasMore, activeSection, currentCategory, searchQuery, nextOffset]);
+    }, [token, accountId, isLoadingContent, hasMore, activeSection, currentCategory, deferredSearchQuery, nextOffset]);
 
     const handleLogin = async (payload: { appEmail: string; appPassword: string }) => {
         setAuthError(null);
@@ -608,7 +567,7 @@ export default function App() {
         setRecordingsOpen(false);
         setScheduleOpen(false);
         setSeriesDetailOpen(false);
-        setFavoritesBySection(createDefaultFavoriteMap());
+        resetFavorites();
         setVodProgressMap({});
         setSeriesProgressMap({});
         setEpisodeProgressMap({});
@@ -639,8 +598,8 @@ export default function App() {
         setIptvSetupError(null);
         setRecordingsOpen(false);
         setScheduleOpen(false);
-        setFavoritesBySection(createDefaultFavoriteMap());
-        setPreferences({ autoplay: true, language: 'fr' });
+        resetFavorites();
+        resetPreferences();
         setVodProgressMap({});
         setSeriesProgressMap({});
         setEpisodeProgressMap({});
@@ -650,52 +609,6 @@ export default function App() {
         needsTranscodeFlagRef.current = false;
         currentlyPlayingRef.current = null;
     };
-
-    const handleToggleFavorite = useCallback(
-        async (item: ContentItem) => {
-            if (!token || !accountId || !item.id) return;
-
-            const itemId = item.id;
-            const wasFavorite = favoritesBySection[activeSection]?.has(itemId) ?? false;
-
-            setFavoritesBySection((prev) => {
-                const nextSet = new Set(prev[activeSection]);
-                if (nextSet.has(itemId)) {
-                    nextSet.delete(itemId);
-                } else {
-                    nextSet.add(itemId);
-                }
-
-                return {
-                    ...prev,
-                    [activeSection]: nextSet,
-                };
-            });
-
-            try {
-                if (wasFavorite) {
-                    await removeFavorite(token, { accountId, section: activeSection, itemId });
-                } else {
-                    await addFavorite(token, { accountId, section: activeSection, itemId });
-                }
-            } catch {
-                setFavoritesBySection((prev) => {
-                    const rollbackSet = new Set(prev[activeSection]);
-                    if (wasFavorite) {
-                        rollbackSet.add(itemId);
-                    } else {
-                        rollbackSet.delete(itemId);
-                    }
-
-                    return {
-                        ...prev,
-                        [activeSection]: rollbackSet,
-                    };
-                });
-            }
-        },
-        [token, accountId, activeSection, favoritesBySection]
-    );
 
     const resolvePlaybackSources = useCallback(
         async (
@@ -1447,10 +1360,15 @@ export default function App() {
         playerOpen && !showIptvDialog && !seriesDetailOpen && !recordingsOpen && !scheduleOpen;
 
     if (!token) {
-        return <LoginPage onLogin={handleLogin} onRegister={handleRegister} isLoading={isLoadingAuth} error={authError} />;
+        return (
+            <MotionConfig reducedMotion={reducedMotion ? 'always' : 'never'}>
+                <LoginPage onLogin={handleLogin} onRegister={handleRegister} isLoading={isLoadingAuth} error={authError} />
+            </MotionConfig>
+        );
     }
 
     return (
+        <MotionConfig reducedMotion={reducedMotion ? 'always' : 'never'}>
         <div className={`min-h-screen transition-colors duration-300 ${isDarkMode ? 'bg-black text-white' : 'bg-gray-50 text-gray-900'}`}>
             <div
                 className={`fixed inset-0 pointer-events-none transition-colors duration-300 ${isDarkMode ? 'bg-gradient-to-br from-red-900/20 via-black to-orange-900/20' : 'bg-gradient-to-br from-red-50 via-white to-orange-50'
@@ -1470,16 +1388,11 @@ export default function App() {
                 onSwitchAccount={handleSwitchAccount}
                 onAddAccount={() => setShowIptvDialog(true)}
                 preferences={preferences}
-                onUpdatePreferences={(prefs) => {
-                    if (!token) return;
-                    const previous = preferences;
-                    setPreferences((prev) => ({ ...prev, ...prefs }));
-                    updatePreferences(token, prefs).catch(() => {
-                        // rollback on error
-                        setPreferences(previous);
-                    });
-                }}
+                onUpdatePreferences={updatePreferences}
                 onClearWatchHistory={handleClearWatchHistory}
+                reducedMotion={reducedMotion}
+                onToggleReducedMotion={setReducedMotion}
+                isWeakDevice={isWeakDevice}
             />
 
             <main className="relative">
@@ -1495,6 +1408,7 @@ export default function App() {
                             type={activeSection}
                             isDarkMode={isDarkMode}
                             featuredItem={featuredItem}
+                            token={token}
                             onPlay={() => {
                                 if (featuredItem) handlePlay(featuredItem);
                             }}
@@ -1528,7 +1442,7 @@ export default function App() {
                                 onOpenRecordings={activeSection === 'live' ? handleOpenRecordings : undefined}
                                 isFavoritesView={currentCategory === 'favorites'}
                                 favoriteIds={favoritesBySection[activeSection]}
-                                onToggleFavorite={handleToggleFavorite}
+                                onToggleFavorite={toggleFavorite}
                                 vodProgressMap={vodProgressMap}
                                 seriesProgressMap={seriesProgressMap}
                                 accountId={accountId}
@@ -1537,6 +1451,8 @@ export default function App() {
                     </motion.div>
                 </AnimatePresence>
             </main>
+
+            <AppFooter isDarkMode={isDarkMode} />
 
             <VideoPlayerModal
                 open={playerOpen}
@@ -1623,5 +1539,6 @@ export default function App() {
                 onSubmit={handleAddIptvAccount}
             />
         </div>
+        </MotionConfig>
     );
 }

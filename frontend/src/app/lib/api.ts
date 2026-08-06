@@ -472,3 +472,30 @@ export async function updatePreferences(token: string, prefs: Partial<UserPrefer
     token
   );
 }
+
+export type TmdbMatch =
+  | { enabled: false }
+  | {
+      enabled: true;
+      id: number;
+      title: string;
+      overview: string | null;
+      posterUrl: string | null;
+      backdropUrl: string | null;
+      rating: number | null;
+      releaseDate: string | null;
+    };
+
+/**
+ * Optional TMDB enrichment for a title. Resolves to { enabled: false } when
+ * the backend has no TMDB_API_KEY configured, or when nothing matches —
+ * callers should always fall back to the Xtream metadata already on hand.
+ */
+export async function fetchTmdbMatch(
+  token: string,
+  params: { title: string; type: 'movie' | 'series'; year?: string }
+): Promise<TmdbMatch> {
+  const query = new URLSearchParams({ title: params.title, type: params.type });
+  if (params.year) query.set('year', params.year);
+  return request<TmdbMatch>(`/api/tmdb/match?${query.toString()}`, { method: 'GET' }, token);
+}

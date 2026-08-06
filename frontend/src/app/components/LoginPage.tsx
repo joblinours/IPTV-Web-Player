@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { motion } from 'motion/react';
 import { User, Lock, Play, Eye, EyeOff } from 'lucide-react';
+import { AppFooter } from './AppFooter';
 
 interface LoginPageProps {
   onLogin: (payload: { appEmail: string; appPassword: string }) => void;
@@ -241,6 +242,7 @@ export function LoginPage({ onLogin, onRegister, isLoading = false, error = null
         >
           © 2026 StreamHub - Plateforme de streaming personnelle
         </motion.p>
+        <AppFooter isDarkMode />
       </motion.div>
     </div>
   );
