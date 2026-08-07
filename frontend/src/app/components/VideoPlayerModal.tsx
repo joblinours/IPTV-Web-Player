@@ -130,6 +130,11 @@ export function VideoPlayerModal({
     // (the instance itself lives in a local `let hls` inside the main
     // effect below, out of reach from render — this ref is the bridge).
     const hlsRef = useRef<Hls | null>(null);
+    // Abstracts "switch to audio track N" over both playback paths: hls.js
+    // (live/HLS) and the browser's native (non-standard, Chromium-only)
+    // HTMLMediaElement.audioTracks (VOD films/series, which play as a plain
+    // <video src=mp4> — hls.js is never involved there at all).
+    const selectAudioTrackRef = useRef<((id: number) => void) | null>(null);
 
     // ── Custom player UI state ───────────────────────────────────────────────
     const [isPlaying, setIsPlaying] = useState(false);
@@ -378,6 +383,7 @@ export function VideoPlayerModal({
         const loadSource = (url: string) => {
             if (hls) { hls.destroy(); hls = null; }
             hlsRef.current = null;
+            selectAudioTrackRef.current = null;
             setAudioTracks([]);
             setActiveAudioTrackId(-1);
             clearWatchdog();
@@ -416,6 +422,9 @@ export function VideoPlayerModal({
                     backBufferLength: 30,
                 });
                 hlsRef.current = hls;
+                selectAudioTrackRef.current = (id) => {
+                    if (hlsRef.current) hlsRef.current.audioTrack = id;
+                };
                 hls.loadSource(url);
                 hls.attachMedia(videoElement);
                 hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, () => {
@@ -450,6 +459,52 @@ export function VideoPlayerModal({
                 });
             } else {
                 videoElement.src = url;
+
+                // Native multi-audio-track support — non-standard (missing
+                // from TypeScript's DOM lib entirely, hence the `any`) but
+                // implemented by Chromium for a plain <video src=mp4> with
+                // several embedded audio streams. This is the only path
+                // that can offer a language picker for VOD films/series,
+                // which never go through hls.js at all (Xtream VOD is a
+                // direct MP4, not HLS). Silently absent (no picker) on
+                // browsers/sources that don't support or declare it —
+                // exactly the "when possible" scope this feature has.
+                const nativeAudioTracks = (videoElement as any).audioTracks as
+                    | {
+                          length: number;
+                          [index: number]: { label?: string; language?: string; enabled: boolean };
+                          addEventListener: (type: string, listener: () => void) => void;
+                          removeEventListener: (type: string, listener: () => void) => void;
+                      }
+                    | undefined;
+
+                if (nativeAudioTracks) {
+                    const updateFromNative = () => {
+                        const list = nativeAudioTracks;
+                        const tracks: Array<{ id: number; label: string }> = [];
+                        let active = -1;
+                        for (let i = 0; i < list.length; i++) {
+                            tracks.push({ id: i, label: list[i].label || list[i].language || `Piste ${i + 1}` });
+                            if (list[i].enabled) active = i;
+                        }
+                        setAudioTracks(tracks);
+                        setActiveAudioTrackId(active);
+                    };
+
+                    nativeAudioTracks.addEventListener('addtrack', updateFromNative);
+                    nativeAudioTracks.addEventListener('removetrack', updateFromNative);
+                    nativeAudioTracks.addEventListener('change', updateFromNative);
+                    // Tracks can already be populated by the time this runs
+                    // (cached metadata) — don't wait solely on the events.
+                    updateFromNative();
+
+                    selectAudioTrackRef.current = (id) => {
+                        for (let i = 0; i < nativeAudioTracks.length; i++) {
+                            nativeAudioTracks[i].enabled = i === id;
+                        }
+                        setActiveAudioTrackId(id);
+                    };
+                }
             }
 
             videoElement.play().catch(() => undefined);
@@ -597,6 +652,7 @@ export function VideoPlayerModal({
             videoElement.load();
             if (hls) hls.destroy();
             hlsRef.current = null;
+            selectAudioTrackRef.current = null;
         };
     }, [open, streamUrl, allSources, isLive]);
 
@@ -907,7 +963,7 @@ export function VideoPlayerModal({
                                                     <button
                                                         key={track.id}
                                                         onClick={() => {
-                                                            if (hlsRef.current) hlsRef.current.audioTrack = track.id;
+                                                            selectAudioTrackRef.current?.(track.id);
                                                             setActiveAudioTrackId(track.id);
                                                             setShowAudioMenu(false);
                                                         }}

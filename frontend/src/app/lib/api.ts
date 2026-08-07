@@ -616,6 +616,7 @@ export interface MediaRequest {
   posterUrl: string | null;
   status: MediaRequestStatus;
   service: 'radarr' | 'sonarr';
+  errorMessage: string | null;
   requestedAt: number;
   updatedAt: number;
 }

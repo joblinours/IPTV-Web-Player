@@ -57,10 +57,19 @@ export function registerTmdbRoutes(app: FastifyInstance) {
     }
 
     const bodySchema = z.object({
+      // `year` is deliberately lenient (any string, or omitted) rather than
+      // a strict 4-digit regex: this array comes straight from Xtream's own
+      // (often messy — empty strings, full dates, garbage) per-item `year`
+      // field, and a `z.array(...)` rejects the ENTIRE request the moment a
+      // single entry fails validation. A malformed year on one card must
+      // never take down TMDB enrichment for the other 49 in the same
+      // batch — real bug this fixes, not a hypothetical one. The 4-digit
+      // shape is enforced below per-entry instead, discarding just that
+      // one field rather than the whole request.
       items: z.array(z.object({
         title: z.string().min(1),
         type: z.enum(['movie', 'series']),
-        year: z.string().regex(/^\d{4}$/).optional(),
+        year: z.string().max(32).optional(),
       })).min(1).max(50),
     });
 
@@ -70,7 +79,12 @@ export function registerTmdbRoutes(app: FastifyInstance) {
     }
 
     const items = await Promise.all(
-      parsed.data.items.map(async (entry) => {
+      parsed.data.items.map(async (rawEntry) => {
+        // Normalize here rather than reject: pull a plausible 4-digit year
+        // out of whatever Xtream sent (a clean "2023", a full date, or
+        // nothing at all), falling back to "no year" instead of failing.
+        const yearMatch = rawEntry.year?.match(/\d{4}/);
+        const entry = { ...rawEntry, year: yearMatch ? yearMatch[0] : undefined };
         const tmdbType = entry.type === 'series' ? 'tv' : 'movie';
         const lookupKey = titleMatchLookupKey(entry.title, tmdbType, entry.year);
         const cached = await getCachedTmdbMatch(lookupKey);
@@ -85,7 +99,12 @@ export function registerTmdbRoutes(app: FastifyInstance) {
         return {
           title: entry.title,
           type: entry.type,
-          year: entry.year ?? null,
+          // Echo back the *raw* year exactly as the client sent it (not the
+          // normalized value used internally for the TMDB lookup key) — the
+          // client builds its own lookup map keyed by its original,
+          // unnormalized item.year, so echoing the normalized one back
+          // would silently break every match/key lookup on the frontend.
+          year: rawEntry.year ?? null,
           match: cached ?? { enabled: false as const },
           pending: cached === null,
         };

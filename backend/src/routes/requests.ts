@@ -193,11 +193,22 @@ export function registerRequestsRoutes(app: FastifyInstance) {
     // rather than short-circuit before it).
     const applyScopedFollowUp = async (sonarrSeriesId: number) => {
       if (scope === 'season') {
-        await sonarrTriggerCommand('SeasonSearch', { seriesId: sonarrSeriesId, seasonNumber: parsed.data.seasonNumber });
+        const ok = await sonarrTriggerCommand('SeasonSearch', { seriesId: sonarrSeriesId, seasonNumber: parsed.data.seasonNumber });
+        if (!ok) {
+          // Previously swallowed silently (a `.catch(() => {})` at the call
+          // site) — the series would end up "added" in the UI with no clue
+          // Sonarr never actually got told to search that season.
+          await execute('UPDATE media_requests SET error_message = ?, updated_at = ? WHERE id = ?', [
+            `Échec du déclenchement de la recherche pour la saison ${parsed.data.seasonNumber}`,
+            nowEpoch(),
+            insertResult.insertId,
+          ]);
+        }
       } else if (scope === 'episode') {
         // Sonarr populates its episode list asynchronously after add — the
         // monitor+search itself happens in a background job, not inline
-        // here (see queue/workers/mediaRequests.ts's processEpisodeMonitor).
+        // here (see queue/workers/mediaRequests.ts's processEpisodeMonitor,
+        // which writes its own error_message if the episode is never found).
         await enqueueEpisodeMonitor({
           requestId: insertResult.insertId,
           sonarrSeriesId,
@@ -214,7 +225,13 @@ export function registerRequestsRoutes(app: FastifyInstance) {
         nowEpoch(),
         insertResult.insertId,
       ]);
-      await applyScopedFollowUp(addResult.body.id).catch(() => {});
+      await applyScopedFollowUp(addResult.body.id).catch((error) =>
+        execute('UPDATE media_requests SET error_message = ?, updated_at = ? WHERE id = ?', [
+          `Suivi de la portée (${scope}) en échec: ${error instanceof Error ? error.message : String(error)}`,
+          nowEpoch(),
+          insertResult.insertId,
+        ])
+      );
       return { id: insertResult.insertId, status: 'added', alreadyRequested: false };
     }
 
@@ -230,7 +247,13 @@ export function registerRequestsRoutes(app: FastifyInstance) {
         nowEpoch(),
         insertResult.insertId,
       ]);
-      await applyScopedFollowUp(existingRemote.id).catch(() => {});
+      await applyScopedFollowUp(existingRemote.id).catch((error) =>
+        execute('UPDATE media_requests SET error_message = ?, updated_at = ? WHERE id = ?', [
+          `Suivi de la portée (${scope}) en échec: ${error instanceof Error ? error.message : String(error)}`,
+          nowEpoch(),
+          insertResult.insertId,
+        ])
+      );
       return { id: insertResult.insertId, status: 'added', alreadyRequested: false };
     }
 
@@ -261,7 +284,7 @@ export function registerRequestsRoutes(app: FastifyInstance) {
       : [request.user.userId];
 
     const rows = await queryAll<any>(
-      `SELECT id, tmdb_id, media_type, scope, season_number, episode_number, title, year, poster_path, status, service, requested_at, updated_at
+      `SELECT id, tmdb_id, media_type, scope, season_number, episode_number, title, year, poster_path, status, service, error_message, requested_at, updated_at
        FROM media_requests WHERE user_id = ? ${whereStatus} ORDER BY requested_at DESC`,
       params
     );
@@ -282,6 +305,10 @@ export function registerRequestsRoutes(app: FastifyInstance) {
         posterUrl: row.poster_path ? `${TMDB_IMAGE_BASE}${row.poster_path}` : null,
         status: row.status,
         service: row.service,
+        // Previously written to the DB on failure but never surfaced —
+        // meant a "failed"/stuck request gave no clue why, to either the
+        // user or whoever's debugging it.
+        errorMessage: row.error_message,
         requestedAt: row.requested_at,
         updatedAt: row.updated_at,
       })),

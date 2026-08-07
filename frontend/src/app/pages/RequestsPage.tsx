@@ -266,6 +266,11 @@ export function RequestsPage() {
                                             )}
                                         </p>
                                         <p className={`text-xs ${isDarkMode ? 'text-gray-400' : 'text-gray-600'}`}>{request.year ?? ''}</p>
+                                        {request.errorMessage && (
+                                            <p className="text-xs text-red-400 mt-0.5 truncate" title={request.errorMessage}>
+                                                {request.errorMessage}
+                                            </p>
+                                        )}
                                     </div>
                                     <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium ${
                                         request.status === 'available' ? 'bg-green-600/20 text-green-400'

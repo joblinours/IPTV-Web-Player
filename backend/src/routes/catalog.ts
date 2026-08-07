@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { queryAll } from '../db.js';
-import { getProvider, loadSource, loadAllSources } from '../sources/index.js';
+import { getProvider, loadSource, loadAllSources, ensureJellyfinSource } from '../sources/index.js';
 import { filterAndPaginate, decodeCursor, favoriteKey } from '../utils.js';
 import { canonicalGenreSlug, genreNameForSlug } from '../lib/genres.js';
 import type { CategoryItem, ContentItem, ContentType, MediaSourceRow } from '../types.js';
@@ -27,12 +27,25 @@ function effectiveCategoryName(effectiveId: string, fallbackName: string): strin
 }
 
 async function listCategoriesMerged(userId: number, type: ContentType): Promise<CategoryItem[]> {
+  // Defensive: don't assume some earlier request (GET /api/iptv/accounts)
+  // already auto-provisioned the Jellyfin source row — a merged fetch that
+  // races ahead of that would otherwise silently merge zero Jellyfin
+  // content, no error, nothing to see. No-op if already provisioned or
+  // JELLYFIN_URL isn't configured.
+  await ensureJellyfinSource(userId);
   const sources = await loadAllSources(userId);
   const results = await Promise.allSettled(sources.map((src) => getProvider(src.kind).listCategories(src, type)));
 
   const merged = new Map<string, string>();
   results.forEach((result, index) => {
-    if (result.status !== 'fulfilled') return;
+    if (result.status !== 'fulfilled') {
+      // Was previously swallowed in total silence — a source erroring out
+      // (Jellyfin unreachable, a TMDB timeout, etc.) meant its content just
+      // never appeared with zero trace of why. Not fatal (the other
+      // sources still merge fine), but must be visible in the logs.
+      console.warn(`[catalog] listCategories failed for source ${sources[index].id} (${sources[index].kind}):`, result.reason);
+      return;
+    }
     const sourceId = sources[index].id;
     for (const category of result.value) {
       if (category.id === 'all' || category.id === 'favorites') continue;
@@ -58,6 +71,7 @@ async function listCategoriesMerged(userId: number, type: ContentType): Promise<
 // remapped ids below), and in practice no slower: it's the same
 // already-cached payload "Tous" already primes for every source.
 async function listContentMerged(userId: number, type: ContentType): Promise<ContentItem[]> {
+  await ensureJellyfinSource(userId);
   const sources = await loadAllSources(userId);
   if (sources.length === 0) return [];
 
@@ -69,7 +83,10 @@ async function listContentMerged(userId: number, type: ContentType): Promise<Con
   const items: ContentItem[] = [];
   sources.forEach((src: MediaSourceRow, index: number) => {
     const contentResult = contentResults[index];
-    if (contentResult.status !== 'fulfilled') return;
+    if (contentResult.status !== 'fulfilled') {
+      console.warn(`[catalog] listContent failed for source ${src.id} (${src.kind}):`, contentResult.reason);
+      return;
+    }
 
     const categoryMap = new Map<string, string>();
     const categoryResult = categoryResults[index];
@@ -77,6 +94,8 @@ async function listContentMerged(userId: number, type: ContentType): Promise<Con
       for (const category of categoryResult.value) {
         categoryMap.set(category.id, effectiveCategoryId(src.id, category));
       }
+    } else {
+      console.warn(`[catalog] listCategories (for remap) failed for source ${src.id} (${src.kind}):`, categoryResult.reason);
     }
 
     for (const item of contentResult.value) {

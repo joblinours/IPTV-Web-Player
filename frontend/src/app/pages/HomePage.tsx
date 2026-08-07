@@ -10,7 +10,7 @@ import { HeroSkeleton } from '../components/skeletons/HeroSkeleton';
 import { fetchContentPage, type ContentItem, type SectionType } from '../lib/api';
 
 const ROW_ITEM_LIMIT = 15;
-const MAX_EXTRA_ROWS = 5;
+const MAX_EXTRA_ROWS = 10;
 
 /**
  * Netflix-style home view: hero slider always on top, then either —
