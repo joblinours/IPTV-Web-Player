@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { db, nowEpoch } from '../db.js';
+import { queryOne, queryAll, execute, nowEpoch } from '../db.js';
 
 export function registerFavoritesRoutes(app: FastifyInstance) {
   app.get('/api/favorites', { preHandler: [app.authenticate] }, async (request: any, reply) => {
@@ -14,17 +14,19 @@ export function registerFavoritesRoutes(app: FastifyInstance) {
       return reply.code(400).send({ message: 'Invalid query' });
     }
 
-    const account = db
-      .prepare('SELECT id FROM iptv_accounts WHERE id = ? AND user_id = ?')
-      .get(parsed.data.accountId, request.user.userId) as { id: number } | undefined;
+    const source = await queryOne<{ id: number }>(
+      'SELECT id FROM media_sources WHERE id = ? AND user_id = ?',
+      [parsed.data.accountId, request.user.userId]
+    );
 
-    if (!account) {
+    if (!source) {
       return reply.code(404).send({ message: 'Account not found' });
     }
 
-    const rows = db
-      .prepare('SELECT item_id FROM favorites WHERE user_id = ? AND account_id = ? AND type = ? ORDER BY id DESC')
-      .all(request.user.userId, parsed.data.accountId, parsed.data.type) as { item_id: string }[];
+    const rows = await queryAll<{ item_id: string }>(
+      'SELECT item_id FROM favorites WHERE user_id = ? AND source_id = ? AND type = ? ORDER BY id DESC',
+      [request.user.userId, parsed.data.accountId, parsed.data.type]
+    );
 
     return { items: rows.map((row) => row.item_id) };
   });
@@ -41,18 +43,20 @@ export function registerFavoritesRoutes(app: FastifyInstance) {
       return reply.code(400).send({ message: 'Invalid payload' });
     }
 
-    const account = db
-      .prepare('SELECT id FROM iptv_accounts WHERE id = ? AND user_id = ?')
-      .get(parsed.data.accountId, request.user.userId) as { id: number } | undefined;
+    const source = await queryOne<{ id: number }>(
+      'SELECT id FROM media_sources WHERE id = ? AND user_id = ?',
+      [parsed.data.accountId, request.user.userId]
+    );
 
-    if (!account) {
+    if (!source) {
       return reply.code(404).send({ message: 'Account not found' });
     }
 
-    db.prepare(
-      `INSERT OR IGNORE INTO favorites(user_id, account_id, type, item_id, created_at)
-       VALUES (?, ?, ?, ?, ?)`
-    ).run(request.user.userId, parsed.data.accountId, parsed.data.type, parsed.data.itemId, nowEpoch());
+    await execute(
+      `INSERT INTO favorites(user_id, source_id, type, item_id, created_at) VALUES (?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE created_at = created_at`,
+      [request.user.userId, parsed.data.accountId, parsed.data.type, parsed.data.itemId, nowEpoch()]
+    );
 
     return { ok: true };
   });
@@ -69,20 +73,21 @@ export function registerFavoritesRoutes(app: FastifyInstance) {
       return reply.code(400).send({ message: 'Invalid payload' });
     }
 
-    const account = db
-      .prepare('SELECT id FROM iptv_accounts WHERE id = ? AND user_id = ?')
-      .get(parsed.data.accountId, request.user.userId) as { id: number } | undefined;
+    const source = await queryOne<{ id: number }>(
+      'SELECT id FROM media_sources WHERE id = ? AND user_id = ?',
+      [parsed.data.accountId, request.user.userId]
+    );
 
-    if (!account) {
+    if (!source) {
       return reply.code(404).send({ message: 'Account not found' });
     }
 
-    db.prepare('DELETE FROM favorites WHERE user_id = ? AND account_id = ? AND type = ? AND item_id = ?').run(
+    await execute('DELETE FROM favorites WHERE user_id = ? AND source_id = ? AND type = ? AND item_id = ?', [
       request.user.userId,
       parsed.data.accountId,
       parsed.data.type,
-      parsed.data.itemId
-    );
+      parsed.data.itemId,
+    ]);
 
     return { ok: true };
   });

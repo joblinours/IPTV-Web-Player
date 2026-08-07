@@ -192,17 +192,22 @@ Frontend available at `http://localhost:8080`.
 
 ## Run with Docker Compose
 
-From the project root:
+The full stack (MySQL, Redis, Jellyfin, Radarr, Sonarr, Prowlarr, qBittorrent, backend, frontend) is defined in the root `docker-compose.yml`. **No `.env` file is used for this deployment path** — every variable is declared directly in `docker-compose.yml`'s `environment:` blocks and resolved from `${VAR}` substitution, which Compose reads from the shell/systemd environment. Required secrets (`JWT_SECRET`, `APP_ENCRYPTION_SECRET`, `MYSQL_PASSWORD`, `MYSQL_ROOT_PASSWORD`) use `${VAR:?message}`, so `docker compose up` refuses to start with a clear error if they're missing instead of booting insecurely.
+
+Export the required values however you prefer on the server — a systemd `EnvironmentFile=`, your process manager's secret store, a shell profile — just not as a file inside this repo. See [`CUTOVER.md`](CUTOVER.md) for the full first-deploy/migration runbook and the complete variable list.
 
 ```bash
-cp backend/.env.example backend/.env
-docker compose up --build
+export JWT_SECRET=... APP_ENCRYPTION_SECRET=... MYSQL_ROOT_PASSWORD=... MYSQL_PASSWORD=...
+docker compose up --build -d
 ```
 
-Services:
+Services (once configured — see `CUTOVER.md`):
 
 - Frontend: `http://localhost:8080`
-- Backend: internal compose service (healthcheck on `/health`)
+- Jellyfin: `http://localhost:8096`
+- Radarr: `http://localhost:7878` · Sonarr: `http://localhost:8989` · Prowlarr: `http://localhost:9696`
+- qBittorrent: `http://localhost:8090`
+- Backend: internal compose service (liveness on `/health`, deep check on `/api/system/health`)
 
 To stop:
 
@@ -213,19 +218,7 @@ docker compose down
 
 ## Environment Variables
 
-### Backend (`backend/.env`)
-
-- `PORT` (default: `4000`)
-- `HOST` (default: `0.0.0.0`)
-- `JWT_SECRET`
-- `APP_ENCRYPTION_SECRET` (minimum 32 characters)
-- `CORS_ORIGIN`
-- `CACHE_TTL_SECONDS`
-- `DB_PATH` (optional depending on environment)
-
-### Frontend (`frontend/.env`)
-
-- `VITE_API_BASE_URL` (example: `http://localhost:4000`)
+`frontend/.env`/`backend/.env` are only used for **local development** (`npm run dev`, outside Docker) — copy `*.env.example` to `*.env` in each package for that workflow. The Docker Compose deployment path above never reads either file; see `docker-compose.yml` for the authoritative list of variables and `CUTOVER.md` for what each one does.
 
 ---
 

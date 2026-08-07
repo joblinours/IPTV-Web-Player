@@ -2,12 +2,28 @@ import type { FastifyInstance } from 'fastify';
 import { spawn } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { z } from 'zod';
-import { db } from '../db.js';
 import { env } from '../config.js';
+import { loadSource, getProvider } from '../sources/index.js';
+import { sanitizeLogText } from '../utils.js';
 import { decryptSecret } from '../crypto.js';
 import { normalizeServerUrl } from '../xtream.js';
-import { sanitizeLogText } from '../utils.js';
-import type { IptvAccountRow, PlaybackTrace } from '../types.js';
+import type { PlaybackTrace } from '../types.js';
+
+// Accepts either the new source-agnostic `itemId` (string — Xtream numeric
+// ids and Jellyfin GUIDs both fit) or the legacy `streamId` (number), so
+// browser tabs still holding the previous frontend bundle during a deploy
+// keep working. Drop `streamId` one release after the frontend stops
+// sending it.
+const idFields = {
+  itemId: z.string().min(1).max(64).optional(),
+  streamId: z.coerce.number().int().positive().optional(),
+};
+
+function resolveExternalId(data: { itemId?: string; streamId?: number }): string | null {
+  if (data.itemId) return data.itemId;
+  if (data.streamId) return String(data.streamId);
+  return null;
+}
 
 // Helper: Parse HTTP Range header (e.g., "bytes=1000-2000", "bytes=1000-", "bytes=-500")
 function parseRangeHeader(rangeHeader: string | undefined, totalBytes: number): { start: number; end: number } | null {
@@ -94,7 +110,7 @@ export function registerStreamRoutes(app: FastifyInstance) {
     const querySchema = z.object({
       accountId: z.coerce.number().int().positive(),
       type: z.enum(['live', 'vod', 'series']),
-      streamId: z.coerce.number().int().positive(),
+      ...idFields,
       containerExtension: z.string().min(2).max(8).optional(),
       mediaTitle: z.string().max(180).optional(),
       seriesTitle: z.string().max(180).optional(),
@@ -103,31 +119,29 @@ export function registerStreamRoutes(app: FastifyInstance) {
     });
 
     const parsed = querySchema.safeParse(request.query);
-    if (!parsed.success) {
+    const externalId = parsed.success ? resolveExternalId(parsed.data) : null;
+    if (!parsed.success || !externalId) {
       return reply.code(400).send({ message: 'Invalid query' });
     }
 
-    const account = db
-      .prepare('SELECT id, server_url, username, password_enc FROM iptv_accounts WHERE id = ? AND user_id = ?')
-      .get(parsed.data.accountId, request.user.userId) as IptvAccountRow | undefined;
-
-    if (!account) {
+    const source = await loadSource(request.user.userId, parsed.data.accountId);
+    if (!source) {
       return reply.code(404).send({ message: 'Account not found' });
     }
 
-    const password = decryptSecret(account.password_enc);
-    const extension =
-      parsed.data.containerExtension ?? (parsed.data.type === 'live' ? 'm3u8' : 'mp4');
-    const pathType = parsed.data.type === 'live' ? 'live' : parsed.data.type === 'vod' ? 'movie' : 'series';
-    const url = `${normalizeServerUrl(account.server_url)}/${pathType}/${account.username}/${password}/${parsed.data.streamId}.${extension}`;
+    const [target] = await getProvider(source.kind).buildPlayback(source, {
+      type: parsed.data.type,
+      itemId: externalId,
+      containerExtension: parsed.data.containerExtension,
+    });
 
     logPlaybackTrace({
       route: 'stream-url',
       mode: 'direct',
       accountId: parsed.data.accountId,
       mediaType: parsed.data.type,
-      streamId: parsed.data.streamId,
-      extension,
+      streamId: Number(externalId) || 0,
+      extension: parsed.data.containerExtension ?? '',
       mediaTitle: parsed.data.mediaTitle,
       seriesTitle: parsed.data.seriesTitle,
       seasonNumber: parsed.data.seasonNumber,
@@ -135,7 +149,7 @@ export function registerStreamRoutes(app: FastifyInstance) {
       note: 'url_generated',
     });
 
-    return { url };
+    return { url: target.url };
   });
 
   app.get('/api/iptv/stream-proxy', async (request: any, reply) => {
@@ -143,7 +157,7 @@ export function registerStreamRoutes(app: FastifyInstance) {
       token: z.string().min(10),
       accountId: z.coerce.number().int().positive(),
       type: z.enum(['live', 'vod', 'series']),
-      streamId: z.coerce.number().int().positive(),
+      ...idFields,
       containerExtension: z.string().min(2).max(8).optional(),
       mediaTitle: z.string().max(180).optional(),
       seriesTitle: z.string().max(180).optional(),
@@ -152,7 +166,8 @@ export function registerStreamRoutes(app: FastifyInstance) {
     });
 
     const parsed = querySchema.safeParse(request.query);
-    if (!parsed.success) {
+    const externalId = parsed.success ? resolveExternalId(parsed.data) : null;
+    if (!parsed.success || !externalId) {
       return reply.code(400).send({ message: 'Invalid query' });
     }
 
@@ -168,23 +183,21 @@ export function registerStreamRoutes(app: FastifyInstance) {
       return reply.code(401).send({ message: 'Unauthorized' });
     }
 
-    const account = db
-      .prepare('SELECT id, server_url, username, password_enc FROM iptv_accounts WHERE id = ? AND user_id = ?')
-      .get(parsed.data.accountId, userId) as IptvAccountRow | undefined;
-
-    if (!account) {
+    const source = await loadSource(userId, parsed.data.accountId);
+    if (!source) {
       return reply.code(404).send({ message: 'Account not found' });
     }
 
-    const password = decryptSecret(account.password_enc);
-    const extension = parsed.data.containerExtension ?? (parsed.data.type === 'live' ? 'm3u8' : 'mp4');
-    const pathType = parsed.data.type === 'live' ? 'live' : parsed.data.type === 'vod' ? 'movie' : 'series';
-    const sourceUrl = `${normalizeServerUrl(account.server_url)}/${pathType}/${account.username}/${password}/${parsed.data.streamId}.${extension}`;
+    const [target] = await getProvider(source.kind).buildPlayback(source, {
+      type: parsed.data.type,
+      itemId: externalId,
+      containerExtension: parsed.data.containerExtension,
+    });
 
     const incomingRange = request.headers.range;
     const buildHeaders = (includeRange: boolean) => ({
       'User-Agent': 'Mozilla/5.0 IPTV-Web-Player',
-      Referer: normalizeServerUrl(account.server_url),
+      ...(target.headers ?? {}),
       ...(includeRange && incomingRange ? { Range: String(incomingRange) } : {}),
     });
 
@@ -192,7 +205,7 @@ export function registerStreamRoutes(app: FastifyInstance) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), env.streamProxyTimeoutMs);
       try {
-        return await fetch(sourceUrl, {
+        return await fetch(target.url, {
           headers: buildHeaders(includeRange),
           signal: controller.signal,
         });
@@ -211,8 +224,8 @@ export function registerStreamRoutes(app: FastifyInstance) {
         mode: 'proxy',
         accountId: parsed.data.accountId,
         mediaType: parsed.data.type,
-        streamId: parsed.data.streamId,
-        extension,
+        streamId: Number(externalId) || 0,
+        extension: parsed.data.containerExtension ?? '',
         mediaTitle: parsed.data.mediaTitle,
         seriesTitle: parsed.data.seriesTitle,
         seasonNumber: parsed.data.seasonNumber,
@@ -235,8 +248,8 @@ export function registerStreamRoutes(app: FastifyInstance) {
           mode: 'proxy',
           accountId: parsed.data.accountId,
           mediaType: parsed.data.type,
-          streamId: parsed.data.streamId,
-          extension,
+          streamId: Number(externalId) || 0,
+          extension: parsed.data.containerExtension ?? '',
           mediaTitle: parsed.data.mediaTitle,
           seriesTitle: parsed.data.seriesTitle,
           seasonNumber: parsed.data.seasonNumber,
@@ -253,8 +266,8 @@ export function registerStreamRoutes(app: FastifyInstance) {
       mode: 'proxy',
       accountId: parsed.data.accountId,
       mediaType: parsed.data.type,
-      streamId: parsed.data.streamId,
-      extension,
+      streamId: Number(externalId) || 0,
+      extension: parsed.data.containerExtension ?? '',
       mediaTitle: parsed.data.mediaTitle,
       seriesTitle: parsed.data.seriesTitle,
       seasonNumber: parsed.data.seasonNumber,
@@ -308,15 +321,19 @@ export function registerStreamRoutes(app: FastifyInstance) {
       return reply.code(400).send({ message: 'Invalid query' });
     }
 
-    const account = db
-      .prepare('SELECT id, server_url, username, password_enc FROM iptv_accounts WHERE id = ? AND user_id = ?')
-      .get(parsed.data.accountId, request.user.userId) as IptvAccountRow | undefined;
-
-    if (!account) {
+    const source = await loadSource(request.user.userId, parsed.data.accountId);
+    if (!source) {
       return reply.code(404).send({ message: 'Account not found' });
     }
 
-    const password = decryptSecret(account.password_enc);
+    if (!getProvider(source.kind).supportsTimeshift) {
+      return reply.code(400).send({ message: 'Timeshift is only supported for Xtream sources' });
+    }
+
+    // Timeshift/catch-up URLs use a provider-specific path shape that
+    // doesn't fit buildPlayback's simple candidate list — Xtream-only,
+    // built the same way stream-url does but against /timeshift/.
+    const password = decryptSecret(source.secret_enc);
 
     const parseDate = (raw: string): Date | null => {
       const direct = new Date(raw);
@@ -345,7 +362,7 @@ export function registerStreamRoutes(app: FastifyInstance) {
       return `${year}-${month}-${day}:${hour}-${minute}-${second}`;
     })();
 
-    const url = `${normalizeServerUrl(account.server_url)}/timeshift/${account.username}/${password}/${parsed.data.durationMinutes}/${normalizedStart}/${parsed.data.streamId}.${parsed.data.containerExtension}`;
+    const url = `${normalizeServerUrl(source.server_url)}/timeshift/${source.username}/${password}/${parsed.data.durationMinutes}/${normalizedStart}/${parsed.data.streamId}.${parsed.data.containerExtension}`;
 
     return { url };
   });
@@ -355,7 +372,7 @@ export function registerStreamRoutes(app: FastifyInstance) {
       token: z.string().min(10),
       accountId: z.coerce.number().int().positive(),
       type: z.enum(['live', 'vod', 'series']),
-      streamId: z.coerce.number().int().positive(),
+      ...idFields,
       seekSeconds: z.coerce.number().min(0).optional(),
       durationSeconds: z.coerce.number().min(1).optional(),
       containerExtension: z.string().min(2).max(8).optional().default('mkv'),
@@ -366,7 +383,8 @@ export function registerStreamRoutes(app: FastifyInstance) {
     });
 
     const parsed = querySchema.safeParse(request.query);
-    if (!parsed.success) {
+    const externalId = parsed.success ? resolveExternalId(parsed.data) : null;
+    if (!parsed.success || !externalId) {
       return reply.code(400).send({ message: 'Invalid query' });
     }
 
@@ -382,24 +400,23 @@ export function registerStreamRoutes(app: FastifyInstance) {
       return reply.code(401).send({ message: 'Unauthorized' });
     }
 
-    const account = db
-      .prepare('SELECT id, server_url, username, password_enc FROM iptv_accounts WHERE id = ? AND user_id = ?')
-      .get(parsed.data.accountId, userId) as IptvAccountRow | undefined;
-
-    if (!account) {
+    const source = await loadSource(userId, parsed.data.accountId);
+    if (!source) {
       return reply.code(404).send({ message: 'Account not found' });
     }
 
-    const password = decryptSecret(account.password_enc);
-    const pathType = parsed.data.type === 'live' ? 'live' : parsed.data.type === 'vod' ? 'movie' : 'series';
-    const sourceUrl = `${normalizeServerUrl(account.server_url)}/${pathType}/${account.username}/${password}/${parsed.data.streamId}.${parsed.data.containerExtension}`;
+    const [target] = await getProvider(source.kind).buildPlayback(source, {
+      type: parsed.data.type,
+      itemId: externalId,
+      containerExtension: parsed.data.containerExtension,
+    });
+    const sourceUrl = target.url;
 
     // Handle Range requests for seeking in transcoded video
     let seekSeconds = typeof parsed.data.seekSeconds === 'number' && Number.isFinite(parsed.data.seekSeconds)
       ? Math.max(0, parsed.data.seekSeconds)
       : 0;
 
-    let isRangeRequest = false;
     let contentRangeHeader: string | undefined;
     let responseStatusCode = 200;
 
@@ -420,7 +437,6 @@ export function registerStreamRoutes(app: FastifyInstance) {
 
         const range = parseRangeHeader(rangeHeader, estimatedTotalBytes);
         if (range) {
-          isRangeRequest = true;
           responseStatusCode = 206;
 
           // Map byte range to time range
@@ -436,7 +452,7 @@ export function registerStreamRoutes(app: FastifyInstance) {
             mode: 'transcode',
             accountId: parsed.data.accountId,
             mediaType: parsed.data.type,
-            streamId: parsed.data.streamId,
+            streamId: Number(externalId) || 0,
             extension: parsed.data.containerExtension,
             mediaTitle: parsed.data.mediaTitle,
             seriesTitle: parsed.data.seriesTitle,
@@ -510,7 +526,7 @@ export function registerStreamRoutes(app: FastifyInstance) {
       mode: 'transcode',
       accountId: parsed.data.accountId,
       mediaType: parsed.data.type,
-      streamId: parsed.data.streamId,
+      streamId: Number(externalId) || 0,
       extension: parsed.data.containerExtension,
       mediaTitle: parsed.data.mediaTitle,
       seriesTitle: parsed.data.seriesTitle,
@@ -549,7 +565,7 @@ export function registerStreamRoutes(app: FastifyInstance) {
         mode: 'transcode',
         accountId: parsed.data.accountId,
         mediaType: parsed.data.type,
-        streamId: parsed.data.streamId,
+        streamId: Number(externalId) || 0,
         extension: parsed.data.containerExtension,
         mediaTitle: parsed.data.mediaTitle,
         seriesTitle: parsed.data.seriesTitle,

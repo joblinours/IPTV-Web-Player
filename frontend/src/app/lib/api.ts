@@ -44,6 +44,12 @@ export interface ContentItem {
   containerExtension?: string | null;
   streamId: number | null;
   seriesId: number | null;
+  // Multi-source (Xtream + Jellyfin) fields — additive, always set by the
+  // backend but optional here so older cached shapes still type-check.
+  source?: 'xtream' | 'jellyfin';
+  sourceId?: number;
+  itemId?: string;
+  tmdbId?: number | null;
 }
 
 export interface IptvAccount {
@@ -51,6 +57,7 @@ export interface IptvAccount {
   name: string;
   server_url: string;
   username: string;
+  kind?: 'xtream' | 'jellyfin';
   created_at: number;
 }
 
@@ -99,7 +106,7 @@ export interface SeriesInfoResponse {
   episodesBySeason: Record<string, SeriesEpisode[]>;
 }
 
-interface Pagination {
+export interface Pagination {
   total: number;
   limit: number;
   offset: number;
@@ -498,4 +505,92 @@ export async function fetchTmdbMatch(
   const query = new URLSearchParams({ title: params.title, type: params.type });
   if (params.year) query.set('year', params.year);
   return request<TmdbMatch>(`/api/tmdb/match?${query.toString()}`, { method: 'GET' }, token);
+}
+
+// ── Discover / Requests (Radarr + Sonarr) ───────────────────────────────────
+
+export interface TmdbSearchResultItem {
+  tmdbId: number;
+  mediaType: 'movie' | 'series';
+  title: string;
+  year: string | null;
+  overview: string | null;
+  posterUrl: string | null;
+  backdropUrl: string | null;
+  rating: number | null;
+}
+
+export interface TmdbSearchResponse {
+  enabled: boolean;
+  page: number;
+  totalPages: number;
+  results: TmdbSearchResultItem[];
+}
+
+export async function searchTmdb(
+  token: string,
+  params: { query: string; type: 'movie' | 'series'; page?: number }
+): Promise<TmdbSearchResponse> {
+  const query = new URLSearchParams({ query: params.query, type: params.type });
+  if (params.page) query.set('page', String(params.page));
+  return request<TmdbSearchResponse>(`/api/tmdb/search?${query.toString()}`, { method: 'GET' }, token);
+}
+
+export type MediaRequestStatus =
+  | 'pending' | 'added' | 'downloading' | 'imported' | 'available' | 'failed' | 'rejected';
+
+export interface MediaRequest {
+  id: number;
+  tmdbId: number;
+  mediaType: 'movie' | 'tv';
+  title: string;
+  year: number | null;
+  posterUrl: string | null;
+  status: MediaRequestStatus;
+  service: 'radarr' | 'sonarr';
+  requestedAt: number;
+  updatedAt: number;
+}
+
+export async function createRequest(
+  token: string,
+  payload: { tmdbId: number; mediaType: 'movie' | 'tv'; title?: string; year?: number; posterPath?: string }
+) {
+  return request<{ id: number; status: string; alreadyRequested: boolean }>(
+    '/api/requests',
+    { method: 'POST', body: JSON.stringify(payload) },
+    token
+  );
+}
+
+export async function fetchRequests(token: string, status?: MediaRequestStatus) {
+  const query = status ? new URLSearchParams({ status }) : null;
+  return request<{ items: MediaRequest[]; pagination: Pagination }>(
+    `/api/requests${query ? `?${query.toString()}` : ''}`,
+    { method: 'GET' },
+    token
+  );
+}
+
+export async function deleteRequest(token: string, id: number) {
+  return request<{ ok: boolean }>(`/api/requests/${id}`, { method: 'DELETE' }, token);
+}
+
+export interface IntegrationsStatus {
+  tmdb: boolean;
+  jellyfin: boolean;
+  radarr: boolean;
+  sonarr: boolean;
+}
+
+export async function fetchIntegrations(token: string) {
+  return request<IntegrationsStatus>('/api/system/integrations', { method: 'GET' }, token);
+}
+
+export async function fetchJellyfinStatus(token: string) {
+  return request<{ configured: boolean; reachable: boolean; version: string | null; serverName: string | null }>(
+    '/api/jellyfin/status',
+    { method: 'GET' },
+    token
+  );
 }

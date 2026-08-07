@@ -1,3 +1,5 @@
+import type { ContentItem } from './types.js';
+
 export function sanitizeLogText(value?: string): string | undefined {
   if (!value) return undefined;
   const normalized = value.trim();
@@ -29,4 +31,32 @@ export function computePagination(total: number, offset: number, limit: number) 
     nextOffset: hasMore ? nextOffset : null,
     nextCursor: hasMore ? encodeCursor(nextOffset) : null,
   };
+}
+
+/**
+ * Source-agnostic filter + paginate, shared by every content provider
+ * (Xtream, Jellyfin, ...) so `routes/catalog.ts` doesn't need to know how
+ * each provider represents categories/titles internally.
+ */
+export function filterAndPaginate(
+  items: ContentItem[],
+  opts: { categoryId: string; search: string; favoriteIds: Set<string> | null; offset: number; limit: number }
+): { items: ContentItem[]; pagination: ReturnType<typeof computePagination> } {
+  const search = opts.search.trim().toLowerCase();
+
+  const filtered = items.filter((item) => {
+    const categoryMatch =
+      opts.categoryId === 'favorites'
+        ? opts.favoriteIds?.has(item.itemId) ?? false
+        : opts.categoryId === 'all' || item.categoryId === opts.categoryId;
+    if (!categoryMatch) return false;
+
+    if (!search) return true;
+    return item.title.toLowerCase().includes(search);
+  });
+
+  const paged = filtered.slice(opts.offset, opts.offset + opts.limit);
+  const pagination = computePagination(filtered.length, opts.offset, opts.limit);
+
+  return { items: paged, pagination };
 }

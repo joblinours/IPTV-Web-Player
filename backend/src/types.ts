@@ -76,9 +76,87 @@ export type PlaybackTrace = {
   note?: string;
 };
 
-export type IptvAccountRow = {
+export type SourceKind = 'xtream' | 'jellyfin';
+
+export type MediaSourceRow = {
   id: number;
+  user_id: number;
+  kind: SourceKind;
+  name: string;
   server_url: string;
   username: string;
-  password_enc: string;
+  secret_enc: string;
+};
+
+/** Normalized content item shape returned by every provider (Xtream, Jellyfin, ...). */
+export type ContentItem = {
+  id: string;
+  title: string;
+  categoryId: string;
+  poster: string | null;
+  description: string | null;
+  genre: string | null;
+  year: string | null;
+  epgChannelId: string | null;
+  hasArchive: boolean;
+  archiveDurationHours: number | null;
+  rating: string | null;
+  duration: string | null;
+  durationSeconds: number | null;
+  containerExtension: string | null;
+  streamId: number | null;
+  seriesId: number | null;
+  // Added for the multi-source (Xtream + Jellyfin) abstraction.
+  source: SourceKind;
+  sourceId: number;
+  itemId: string;
+  tmdbId?: number | null;
+};
+
+export type PlaybackTarget = {
+  url: string;
+  headers?: Record<string, string>;
+  hint: 'direct' | 'hls' | 'transcode';
+};
+
+export type CategoryItem = { id: string; name: string };
+
+export type EpgItem = {
+  title: string;
+  description: string;
+  start?: string;
+  end?: string;
+  startTimestamp?: number;
+  stopTimestamp?: number;
+};
+
+export type SeriesEpisode = {
+  id: number;
+  title: string;
+  episodeNumber: number;
+  seasonNumber: number;
+  containerExtension: string;
+  duration: string | null;
+  durationSeconds: number | null;
+  poster: string | null;
+  rating: number | null;
+  airDate: string | null;
+};
+
+export type SeriesInfoResponse = {
+  info: {
+    name: string;
+    cover: string | null;
+    plot: string | null;
+    cast: string | null;
+    director: string | null;
+    genre: string | null;
+    releaseDate: string | null;
+    rating: string | null;
+    rating5Based: string | null;
+    episodeRunTime: string | null;
+    backdropPath: string[];
+  };
+  seasons: Array<{ seasonNumber: number; episodeCount: number }>;
+  episodesBySeason: Record<string, SeriesEpisode[]>;
 };

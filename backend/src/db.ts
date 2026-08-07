@@ -1,113 +1,112 @@
-import Database from 'better-sqlite3';
+import mysql, { type ResultSetHeader, type PoolConnection } from 'mysql2/promise';
 import { env } from './config.js';
+import { migrations } from './db/migrations.js';
 
-export const db = new Database(env.dbPath);
+export const pool = mysql.createPool({
+  host: env.mysqlHost,
+  port: env.mysqlPort,
+  user: env.mysqlUser,
+  password: env.mysqlPassword,
+  database: env.mysqlDatabase,
+  connectionLimit: env.mysqlPoolSize,
+  waitForConnections: true,
+  queueLimit: 0,
+  charset: 'utf8mb4_unicode_ci',
+  timezone: 'Z',
+  enableKeepAlive: true,
+  keepAliveInitialDelay: 10_000,
+});
 
 export function nowEpoch(): number {
   return Math.floor(Date.now() / 1000);
 }
 
-export function initDb() {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      email TEXT NOT NULL UNIQUE,
-      password_hash TEXT NOT NULL,
-      created_at INTEGER NOT NULL
-    );
+/**
+ * Typed query helpers — deliberately NOT `db.prepare(...).get() as T` like the
+ * old better-sqlite3 code. That pattern silences the type checker on a
+ * forgotten `await`, which `tsc --noEmit` (our only pre-deploy gate) cannot
+ * catch. These return real Promises, so a missing `await` is a compile error
+ * on the very next property access instead of a runtime crash.
+ */
+export async function queryOne<T>(sql: string, params: any[] = []): Promise<T | undefined> {
+  const [rows] = await pool.query(sql, params);
+  const list = rows as T[];
+  return list[0];
+}
 
-    CREATE TABLE IF NOT EXISTS iptv_accounts (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL,
-      name TEXT NOT NULL,
-      server_url TEXT NOT NULL,
-      username TEXT NOT NULL,
-      password_enc TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      FOREIGN KEY(user_id) REFERENCES users(id)
-    );
+export async function queryAll<T>(sql: string, params: any[] = []): Promise<T[]> {
+  const [rows] = await pool.query(sql, params);
+  return rows as T[];
+}
 
-    CREATE TABLE IF NOT EXISTS cache_entries (
-      cache_key TEXT PRIMARY KEY,
-      payload TEXT NOT NULL,
-      expires_at INTEGER NOT NULL
-    );
+export async function execute(sql: string, params: any[] = []): Promise<ResultSetHeader> {
+  const [result] = await pool.execute(sql, params);
+  return result as ResultSetHeader;
+}
 
-    CREATE TABLE IF NOT EXISTS favorites (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL,
-      account_id INTEGER NOT NULL,
-      type TEXT NOT NULL CHECK(type IN ('live', 'vod', 'series')),
-      item_id TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      FOREIGN KEY(user_id) REFERENCES users(id),
-      FOREIGN KEY(account_id) REFERENCES iptv_accounts(id),
-      UNIQUE(user_id, account_id, type, item_id)
-    );
+export async function withTransaction<T>(fn: (connection: PoolConnection) => Promise<T>): Promise<T> {
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const result = await fn(connection);
+    await connection.commit();
+    return result;
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
 
-    CREATE INDEX IF NOT EXISTS idx_favorites_user_account_type
-      ON favorites(user_id, account_id, type);
+/** Retries the initial connection so the backend survives MySQL starting a few seconds slower. */
+export async function waitForDb(timeoutMs = 60_000): Promise<void> {
+  const start = Date.now();
+  let lastError: unknown;
+  while (Date.now() - start < timeoutMs) {
+    try {
+      await pool.query('SELECT 1');
+      return;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+  }
+  throw new Error(`Could not reach MySQL within ${timeoutMs}ms: ${String(lastError)}`);
+}
 
-    CREATE INDEX IF NOT EXISTS idx_favorites_item
-      ON favorites(item_id);
-
-    CREATE TABLE IF NOT EXISTS watch_progress (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL,
-      account_id INTEGER NOT NULL,
-      type TEXT NOT NULL CHECK(type IN ('vod', 'series_episode')),
-      item_id TEXT NOT NULL,
-      series_id TEXT,
-      season_number INTEGER,
-      episode_number INTEGER,
-      current_time REAL NOT NULL DEFAULT 0,
-      total_duration REAL NOT NULL DEFAULT 0,
-      is_watched INTEGER NOT NULL DEFAULT 0,
-      needs_transcode INTEGER NOT NULL DEFAULT 0,
-      updated_at INTEGER NOT NULL,
-      FOREIGN KEY(user_id) REFERENCES users(id),
-      FOREIGN KEY(account_id) REFERENCES iptv_accounts(id),
-      UNIQUE(user_id, account_id, type, item_id)
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_watch_progress_user_account_type
-      ON watch_progress(user_id, account_id, type);
-
-    CREATE INDEX IF NOT EXISTS idx_watch_progress_series
-      ON watch_progress(user_id, account_id, series_id);
-
-    CREATE TABLE IF NOT EXISTS user_preferences (
-      user_id INTEGER PRIMARY KEY,
-      autoplay INTEGER NOT NULL DEFAULT 1,
-      language TEXT NOT NULL DEFAULT 'fr',
-      updated_at INTEGER NOT NULL,
-      FOREIGN KEY(user_id) REFERENCES users(id)
-    );
+/** Minimal migration runner: TS-embedded `up` scripts, tracked in schema_migrations. */
+export async function runMigrations(): Promise<void> {
+  await execute(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version VARCHAR(64) NOT NULL PRIMARY KEY,
+      applied_at BIGINT NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
 
-  // Migration: add needs_transcode column if it doesn't exist yet (safe on fresh DB too)
-  try {
-    db.exec(`ALTER TABLE watch_progress ADD COLUMN needs_transcode INTEGER NOT NULL DEFAULT 0`);
-  } catch {
-    /* column already exists */
-  }
-}
+  const applied = new Set(
+    (await queryAll<{ version: string }>('SELECT version FROM schema_migrations')).map((row) => row.version)
+  );
 
-/** Generic TTL-backed cache, shared by Xtream catalog lookups and TMDB matches. */
-export function getCache<T>(key: string): T | null {
-  const row = db.prepare('SELECT payload, expires_at FROM cache_entries WHERE cache_key = ?').get(key) as
-    | { payload: string; expires_at: number }
-    | undefined;
-  if (!row) return null;
-  if (row.expires_at <= nowEpoch()) {
-    db.prepare('DELETE FROM cache_entries WHERE cache_key = ?').run(key);
-    return null;
-  }
-  return JSON.parse(row.payload) as T;
-}
+  for (const migration of migrations) {
+    if (applied.has(migration.version)) continue;
 
-export function setCache<T>(key: string, value: T, ttlSeconds: number): void {
-  db.prepare(
-    'INSERT OR REPLACE INTO cache_entries(cache_key, payload, expires_at) VALUES(?, ?, ?)'
-  ).run(key, JSON.stringify(value), nowEpoch() + ttlSeconds);
+    console.log(`[db] applying migration ${migration.version}`);
+    // Multiple `CREATE TABLE ...;` statements per migration — mysql2 needs
+    // multipleStatements for this, so split and run them one at a time
+    // instead of enabling that flag pool-wide (it's a SQL-injection footgun).
+    const statements = migration.up
+      .split(';')
+      .map((statement) => statement.trim())
+      .filter(Boolean);
+
+    for (const statement of statements) {
+      await execute(statement);
+    }
+
+    await execute('INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)', [
+      migration.version,
+      nowEpoch(),
+    ]);
+  }
 }

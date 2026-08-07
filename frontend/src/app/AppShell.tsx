@@ -1,17 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Outlet, useNavigate, useLocation } from 'react-router';
 import { motion, AnimatePresence, MotionConfig } from 'motion/react';
 import { usePerformanceMode } from './hooks/usePerformanceMode';
 import { useFavorites } from './hooks/useFavorites';
 import { usePreferences } from './hooks/usePreferences';
+import { AppContext, type AppContextValue, type SeriesStatsMap, type VodProgressMap, type SeriesProgressMap, type EpisodeProgressMap } from './AppContext';
 import { Header } from './components/Header';
-import { Hero } from './components/Hero';
-import { CategoryTabs } from './components/CategoryTabs';
 import { LoginPage } from './components/LoginPage';
 import { AppFooter } from './components/AppFooter';
 import { IptvCredentialsDialog } from './components/IptvCredentialsDialog';
-import { PaginatedContentGrid } from './components/PaginatedContentGrid';
 import { VideoPlayerModal } from './components/VideoPlayerModal';
-import { SeriesDetailModal } from './components/SeriesDetailModal';
 import { LiveRecordingsDialog } from './components/LiveRecordingsDialog';
 import { LiveScheduleDialog } from './components/LiveScheduleDialog';
 import {
@@ -20,6 +18,7 @@ import {
     fetchCategories,
     fetchContentPage,
     fetchEpg,
+    fetchIntegrations,
     fetchProgress,
     fetchSeriesInfo,
     fetchSeriesProgress,
@@ -34,21 +33,16 @@ import {
     type CategoryItem,
     type ContentItem,
     type EpgItem,
+    type IntegrationsStatus,
     type IptvAccount,
-    type ProgressEntry,
     type SeriesEpisode,
     type SeriesInfoResponse,
-    type SeriesProgressSummary,
     type PlaybackDebugContext,
     type SectionType,
 } from './lib/api';
 
 type CategoryMap = Record<SectionType, CategoryItem[]>;
 type SelectedCategoryMap = Record<SectionType, string>;
-type SeriesStatsMap = Record<number, { seasonsCount: number; episodesCount: number }>;
-type VodProgressMap = Record<string, ProgressEntry>;
-type SeriesProgressMap = Record<string, SeriesProgressSummary>;
-type EpisodeProgressMap = Record<string, { currentTime: number; totalDuration: number; isWatched: boolean; needsTranscode: boolean }>;
 
 type CurrentlyPlayingMeta = {
     type: 'vod' | 'series_episode';
@@ -71,7 +65,6 @@ function findNextEpisode(
         return currentSeasonEps[currentIdx + 1];
     }
 
-    // Try next seasons in order
     const orderedSeasons = seriesData.seasons.map((s) => s.seasonNumber).sort((a, b) => a - b);
     const currentSeasonIdx = orderedSeasons.indexOf(seasonNumber);
     if (currentSeasonIdx >= 0) {
@@ -95,7 +88,6 @@ function findPreviousEpisode(
         return currentSeasonEps[currentIdx - 1];
     }
 
-    // Try previous seasons in reverse order.
     const orderedSeasons = seriesData.seasons.map((s) => s.seasonNumber).sort((a, b) => a - b);
     const currentSeasonIdx = orderedSeasons.indexOf(seasonNumber);
     if (currentSeasonIdx > 0) {
@@ -122,15 +114,12 @@ function addSeekToTranscodeSources(sources: string[], seekSeconds?: number): str
 
         try {
             const isAbsolute = /^https?:\/\//i.test(source);
-            const url = isAbsolute
-                ? new URL(source)
-                : new URL(source, window.location.origin);
+            const url = isAbsolute ? new URL(source) : new URL(source, window.location.origin);
             url.searchParams.set('seekSeconds', seekSeconds.toFixed(3));
 
             if (isAbsolute) return url.toString();
             return `${url.pathname}${url.search}${url.hash}`;
         } catch {
-            // Keep the original source instead of breaking playback.
             return source;
         }
     });
@@ -177,7 +166,18 @@ function toEpochSeconds(item: EpgItem, useStop: boolean): number | null {
     return Math.floor(parsed / 1000);
 }
 
-export default function App() {
+/**
+ * Owns every piece of session/catalog/player/progress state the app needs —
+ * exactly what App.tsx used to own directly before routing existed — and
+ * exposes it via AppContext so routed pages (HomePage, DetailsPage,
+ * SearchPage, RequestsPage) can consume it without prop-drilling. Renders
+ * the persistent chrome (Header, player, dialogs, footer) around an
+ * <Outlet/> for the active route.
+ */
+export default function AppShell() {
+    const navigate = useNavigate();
+    const location = useLocation();
+
     const { reducedMotion, setReducedMotion, isWeakDevice } = usePerformanceMode();
     const [token, setToken] = useState<string | null>(() => localStorage.getItem('iptv_token'));
     const [accounts, setAccounts] = useState<IptvAccount[]>([]);
@@ -186,9 +186,6 @@ export default function App() {
     const [categoriesBySection, setCategoriesBySection] = useState<CategoryMap>(defaultCategories);
     const [selectedCategories, setSelectedCategories] = useState<SelectedCategoryMap>(defaultSelectedCategories);
     const [searchQuery, setSearchQuery] = useState('');
-    // The input stays bound to `searchQuery` for instant feedback; the catalog
-    // fetch effects below depend on this debounced copy instead, so typing
-    // doesn't fire one request per keystroke against large Xtream catalogs.
     const [deferredSearchQuery, setDeferredSearchQuery] = useState('');
     useEffect(() => {
         const timer = setTimeout(() => setDeferredSearchQuery(searchQuery), 300);
@@ -230,7 +227,6 @@ export default function App() {
     const [scheduleLoading, setScheduleLoading] = useState(false);
     const [scheduleItems, setScheduleItems] = useState<EpgItem[]>([]);
 
-    // ── Watch progress & preferences ─────────────────────────────────────────
     const { preferences, updatePreferences, resetPreferences } = usePreferences(token);
     const [vodProgressMap, setVodProgressMap] = useState<VodProgressMap>({});
     const [seriesProgressMap, setSeriesProgressMap] = useState<SeriesProgressMap>({});
@@ -243,8 +239,16 @@ export default function App() {
         currentEpisode: SeriesEpisode;
     } | null>(null);
     const currentlyPlayingRef = useRef<CurrentlyPlayingMeta | null>(null);
-    // Set to true when the player falls back to ffmpeg transcode; piggybacked onto next updateProgress call
     const needsTranscodeFlagRef = useRef(false);
+
+    const [integrations, setIntegrations] = useState<IntegrationsStatus | null>(null);
+    const refreshIntegrations = useCallback(() => {
+        if (!token) return;
+        fetchIntegrations(token).then(setIntegrations).catch(() => {});
+    }, [token]);
+    useEffect(() => {
+        refreshIntegrations();
+    }, [refreshIntegrations]);
 
     const currentCategory = selectedCategories[activeSection];
     const featuredItem = useMemo(() => items[0] ?? null, [items]);
@@ -315,7 +319,6 @@ export default function App() {
                     setSelectedCategories((prev) => ({ ...prev, [activeSection]: 'all' }));
                     return;
                 }
-
             } catch {
                 if (!cancelled) {
                     setCategoriesBySection((prev) => ({
@@ -376,14 +379,13 @@ export default function App() {
         };
     }, [token, accountId, activeSection, currentCategory, deferredSearchQuery]);
 
-    // Prefetch series stats (seasons/episodes count)
     useEffect(() => {
-
         const targets = items
             .filter((item) => !!item.seriesId && !seriesStatsMap[item.seriesId])
             .slice(0, 8);
 
         if (targets.length === 0) return;
+        if (!token || !accountId) return;
 
         let cancelled = false;
 
@@ -414,7 +416,6 @@ export default function App() {
         };
     }, [token, accountId, activeSection, items, seriesStatsMap]);
 
-    // Prefetch series progress summaries (for smart play button on tiles)
     useEffect(() => {
         if (!token || !accountId || activeSection !== 'series' || items.length === 0) return;
 
@@ -443,7 +444,6 @@ export default function App() {
         return () => { cancelled = true; };
     }, [token, accountId, activeSection, items]);
 
-    // Prefetch VOD progress for current page
     useEffect(() => {
         if (!token || !accountId || activeSection !== 'films' || items.length === 0) return;
 
@@ -543,17 +543,12 @@ export default function App() {
         setIptvSetupError(null);
         setIsLoadingIptvSetup(true);
         try {
-            const created = await addIptvAccount(token, {
-                name: payload.name,
-                serverUrl: payload.serverUrl,
-                username: payload.username,
-                password: payload.password,
-            });
+            const created = await addIptvAccount(token, payload);
             await refreshAccounts();
             setAccountId(Number(created.accountId));
             setShowIptvDialog(false);
         } catch (error) {
-            setIptvSetupError(error instanceof Error ? error.message : 'Impossible d\'ajouter le compte IPTV');
+            setIptvSetupError(error instanceof Error ? error.message : "Impossible d'ajouter le compte IPTV");
         } finally {
             setIsLoadingIptvSetup(false);
         }
@@ -608,6 +603,7 @@ export default function App() {
         setPlayerRealDuration(undefined);
         needsTranscodeFlagRef.current = false;
         currentlyPlayingRef.current = null;
+        navigate('/');
     };
 
     const resolvePlaybackSources = useCallback(
@@ -622,8 +618,6 @@ export default function App() {
             const normalizedContainer = (item.containerExtension ?? '').toLowerCase();
             const base =
                 section === 'live'
-                    // Prefer TS first for better compatibility with proxied live streams,
-                    // then try m3u8 and the provider-declared extension.
                     ? ['ts', 'm3u8', normalizedContainer || 'ts']
                     : [normalizedContainer || 'mp4', 'mp4', 'ts', 'm3u8'];
 
@@ -634,46 +628,19 @@ export default function App() {
                         if (section === 'live') {
                             const mustProxy = window.location.protocol === 'https:';
                             if (mustProxy) {
-                                return buildStreamProxyUrl({
-                                    token,
-                                    accountId,
-                                    section,
-                                    streamId,
-                                    containerExtension: extension,
-                                    debugContext,
-                                });
+                                return buildStreamProxyUrl({ token, accountId, section, streamId, containerExtension: extension, debugContext });
                             }
 
-                            const response = await fetchStreamUrl(token, {
-                                accountId,
-                                section,
-                                streamId,
-                                containerExtension: extension,
-                                debugContext,
-                            });
+                            const response = await fetchStreamUrl(token, { accountId, section, streamId, containerExtension: extension, debugContext });
 
                             if (/^http:\/\//i.test(response.url)) {
-                                return buildStreamProxyUrl({
-                                    token,
-                                    accountId,
-                                    section,
-                                    streamId,
-                                    containerExtension: extension,
-                                    debugContext,
-                                });
+                                return buildStreamProxyUrl({ token, accountId, section, streamId, containerExtension: extension, debugContext });
                             }
 
                             return response.url;
                         }
 
-                        return buildStreamProxyUrl({
-                            token,
-                            accountId,
-                            section,
-                            streamId,
-                            containerExtension: extension,
-                            debugContext,
-                        });
+                        return buildStreamProxyUrl({ token, accountId, section, streamId, containerExtension: extension, debugContext });
                     } catch {
                         return null;
                     }
@@ -682,20 +649,15 @@ export default function App() {
 
             if (section === 'films' || section === 'series') {
                 const transcodeUrl = buildTranscodeUrl({
-                    token,
-                    accountId,
-                    section,
-                    streamId,
+                    token, accountId, section, streamId,
                     containerExtension: normalizedContainer || 'mp4',
                     durationSeconds: item.durationSeconds,
                     debugContext,
                 });
 
                 if (normalizedContainer === 'mkv') {
-                    // Keep MKV transcode near the top as it is often the first playable source.
                     urls.splice(1, 0, transcodeUrl);
                 } else {
-                    // Place transcode before late-format retries (like m3u8) to avoid long dead ends.
                     urls.splice(Math.min(2, urls.length), 0, transcodeUrl);
                 }
             }
@@ -703,10 +665,7 @@ export default function App() {
             if (section === 'live') {
                 urls.push(
                     buildTranscodeUrl({
-                        token,
-                        accountId,
-                        section,
-                        streamId,
+                        token, accountId, section, streamId,
                         containerExtension: normalizedContainer || 'ts',
                         durationSeconds: item.durationSeconds,
                         debugContext,
@@ -737,15 +696,8 @@ export default function App() {
             const needsTranscode = needsTranscodeFlagRef.current || undefined;
 
             updateProgress(token, {
-                accountId: ctx.accountId,
-                type: ctx.type,
-                itemId: ctx.itemId,
-                seriesId: ctx.seriesId,
-                seasonNumber: ctx.seasonNumber,
-                episodeNumber: ctx.episodeNumber,
-                currentTime,
-                totalDuration: duration,
-                needsTranscode,
+                accountId: ctx.accountId, type: ctx.type, itemId: ctx.itemId, seriesId: ctx.seriesId,
+                seasonNumber: ctx.seasonNumber, episodeNumber: ctx.episodeNumber, currentTime, totalDuration: duration, needsTranscode,
             }).catch(() => {});
 
             const isWatched = duration > 0 && duration - currentTime <= 10;
@@ -754,12 +706,8 @@ export default function App() {
                 setVodProgressMap((prev) => ({
                     ...prev,
                     [`${accountId}:${ctx.itemId}`]: {
-                        itemId: ctx.itemId,
-                        currentTime,
-                        totalDuration: duration,
-                        isWatched,
-                        needsTranscode: needsTranscode ?? false,
-                        updatedAt: Math.floor(Date.now() / 1000),
+                        itemId: ctx.itemId, currentTime, totalDuration: duration, isWatched,
+                        needsTranscode: needsTranscode ?? false, updatedAt: Math.floor(Date.now() / 1000),
                     },
                 }));
             } else if (ctx.type === 'series_episode' && ctx.seriesId) {
@@ -774,13 +722,8 @@ export default function App() {
                         ...prev,
                         [key]: {
                             lastEpisode: {
-                                episodeId: ctx.itemId,
-                                seasonNumber: ctx.seasonNumber ?? null,
-                                episodeNumber: ctx.episodeNumber ?? null,
-                                currentTime,
-                                totalDuration: duration,
-                                isWatched,
-                                needsTranscode: needsTranscode ?? false,
+                                episodeId: ctx.itemId, seasonNumber: ctx.seasonNumber ?? null, episodeNumber: ctx.episodeNumber ?? null,
+                                currentTime, totalDuration: duration, isWatched, needsTranscode: needsTranscode ?? false,
                             },
                             watchedEpisodeIds: existing?.watchedEpisodeIds ?? [],
                         },
@@ -800,28 +743,16 @@ export default function App() {
             const needsTranscode = needsTranscodeFlagRef.current || undefined;
 
             updateProgress(token, {
-                accountId: ctx.accountId,
-                type: ctx.type,
-                itemId: ctx.itemId,
-                seriesId: ctx.seriesId,
-                seasonNumber: ctx.seasonNumber,
-                episodeNumber: ctx.episodeNumber,
-                currentTime,
-                totalDuration: duration,
-                isWatched: true,
-                needsTranscode,
+                accountId: ctx.accountId, type: ctx.type, itemId: ctx.itemId, seriesId: ctx.seriesId,
+                seasonNumber: ctx.seasonNumber, episodeNumber: ctx.episodeNumber, currentTime, totalDuration: duration, isWatched: true, needsTranscode,
             }).catch(() => {});
 
             if (ctx.type === 'vod') {
                 setVodProgressMap((prev) => ({
                     ...prev,
                     [`${accountId}:${ctx.itemId}`]: {
-                        itemId: ctx.itemId,
-                        currentTime,
-                        totalDuration: duration,
-                        isWatched: true,
-                        needsTranscode: needsTranscode ?? false,
-                        updatedAt: Math.floor(Date.now() / 1000),
+                        itemId: ctx.itemId, currentTime, totalDuration: duration, isWatched: true,
+                        needsTranscode: needsTranscode ?? false, updatedAt: Math.floor(Date.now() / 1000),
                     },
                 }));
             } else if (ctx.type === 'series_episode' && ctx.seriesId) {
@@ -838,13 +769,8 @@ export default function App() {
                         ...prev,
                         [key]: {
                             lastEpisode: {
-                                episodeId: ctx.itemId,
-                                seasonNumber: ctx.seasonNumber ?? null,
-                                episodeNumber: ctx.episodeNumber ?? null,
-                                currentTime,
-                                totalDuration: duration,
-                                isWatched: true,
-                                needsTranscode: needsTranscode ?? false,
+                                episodeId: ctx.itemId, seasonNumber: ctx.seasonNumber ?? null, episodeNumber: ctx.episodeNumber ?? null,
+                                currentTime, totalDuration: duration, isWatched: true, needsTranscode: needsTranscode ?? false,
                             },
                             watchedEpisodeIds: [...newWatched],
                         },
@@ -863,7 +789,6 @@ export default function App() {
         if (!token || !accountId) return;
         try {
             await clearWatchHistory(token, accountId);
-            // Clear the progress maps
             setVodProgressMap({});
             setSeriesProgressMap({});
             setEpisodeProgressMap({});
@@ -883,26 +808,11 @@ export default function App() {
 
         const rawSources = await resolvePlaybackSources(
             {
-                id: String(next.id),
-                title: next.title,
-                categoryId: '',
-                poster: next.poster,
-                description: null,
-                genre: null,
-                year: null,
-                rating: next.rating ? String(next.rating) : null,
-                containerExtension: next.containerExtension,
-                streamId: null,
-                seriesId: next.id,
+                id: String(next.id), title: next.title, categoryId: '', poster: next.poster, description: null, genre: null, year: null,
+                rating: next.rating ? String(next.rating) : null, containerExtension: next.containerExtension, streamId: null, seriesId: next.id,
             },
-            'series',
-            next.id,
-            {
-                mediaTitle: next.title,
-                seriesTitle: seriesData.info.name,
-                seasonNumber: next.seasonNumber,
-                episodeNumber: next.episodeNumber,
-            }
+            'series', next.id,
+            { mediaTitle: next.title, seriesTitle: seriesData.info.name, seasonNumber: next.seasonNumber, episodeNumber: next.episodeNumber }
         );
 
         if (rawSources.length === 0) return;
@@ -910,14 +820,7 @@ export default function App() {
         const nextEpProg = episodeProgressMap[String(next.id)];
         const sources = nextEpProg?.needsTranscode ? reorderWithTranscodeFirst(rawSources) : rawSources;
 
-        currentlyPlayingRef.current = {
-            type: 'series_episode',
-            itemId: String(next.id),
-            accountId,
-            seriesId: currentSeriesId,
-            seasonNumber: next.seasonNumber,
-            episodeNumber: next.episodeNumber,
-        };
+        currentlyPlayingRef.current = { type: 'series_episode', itemId: String(next.id), accountId, seriesId: currentSeriesId, seasonNumber: next.seasonNumber, episodeNumber: next.episodeNumber };
         setCurrentSeriesPlayContext({ seriesData, currentEpisode: next });
         setPlayerStartTime(undefined);
         setPlayerRealDuration(next.durationSeconds ?? undefined);
@@ -933,53 +836,24 @@ export default function App() {
         const { seriesData, currentEpisode } = currentSeriesPlayContext;
         const currentSeriesId = currentlyPlayingRef.current?.seriesId;
 
-        const previous = findPreviousEpisode(
-            seriesData,
-            currentEpisode.seasonNumber,
-            currentEpisode.episodeNumber
-        );
-        // At the very first available episode: no-op by design.
+        const previous = findPreviousEpisode(seriesData, currentEpisode.seasonNumber, currentEpisode.episodeNumber);
         if (!previous) return;
 
         const rawSources = await resolvePlaybackSources(
             {
-                id: String(previous.id),
-                title: previous.title,
-                categoryId: '',
-                poster: previous.poster,
-                description: null,
-                genre: null,
-                year: null,
-                rating: previous.rating ? String(previous.rating) : null,
-                containerExtension: previous.containerExtension,
-                streamId: null,
-                seriesId: previous.id,
+                id: String(previous.id), title: previous.title, categoryId: '', poster: previous.poster, description: null, genre: null, year: null,
+                rating: previous.rating ? String(previous.rating) : null, containerExtension: previous.containerExtension, streamId: null, seriesId: previous.id,
             },
-            'series',
-            previous.id,
-            {
-                mediaTitle: previous.title,
-                seriesTitle: seriesData.info.name,
-                seasonNumber: previous.seasonNumber,
-                episodeNumber: previous.episodeNumber,
-            }
+            'series', previous.id,
+            { mediaTitle: previous.title, seriesTitle: seriesData.info.name, seasonNumber: previous.seasonNumber, episodeNumber: previous.episodeNumber }
         );
 
         if (rawSources.length === 0) return;
 
         const previousEpProg = episodeProgressMap[String(previous.id)];
-        const sources = previousEpProg?.needsTranscode
-            ? reorderWithTranscodeFirst(rawSources)
-            : rawSources;
+        const sources = previousEpProg?.needsTranscode ? reorderWithTranscodeFirst(rawSources) : rawSources;
 
-        currentlyPlayingRef.current = {
-            type: 'series_episode',
-            itemId: String(previous.id),
-            accountId,
-            seriesId: currentSeriesId,
-            seasonNumber: previous.seasonNumber,
-            episodeNumber: previous.episodeNumber,
-        };
+        currentlyPlayingRef.current = { type: 'series_episode', itemId: String(previous.id), accountId, seriesId: currentSeriesId, seasonNumber: previous.seasonNumber, episodeNumber: previous.episodeNumber };
         setCurrentSeriesPlayContext({ seriesData, currentEpisode: previous });
         setPlayerStartTime(undefined);
         setPlayerRealDuration(previous.durationSeconds ?? undefined);
@@ -994,6 +868,12 @@ export default function App() {
         async (item: ContentItem) => {
             if (!token || !accountId || !item.seriesId) return;
 
+            // Netflix-style: a dedicated page instead of a modal — the page
+            // reads seriesDetailData/seriesDetailLoading from this same context.
+            if (!location.pathname.startsWith(`/tv/${accountId}/${item.seriesId}`)) {
+                navigate(`/tv/${accountId}/${item.seriesId}`);
+            }
+
             setSeriesDetailLoading(true);
             setSeriesDetailOpen(true);
             setSeriesDetailItemId(item.seriesId);
@@ -1004,26 +884,15 @@ export default function App() {
 
                 const seasonsCount = data.seasons.length;
                 const episodesCount = Object.values(data.episodesBySeason).reduce((total, list) => total + list.length, 0);
-                setSeriesStatsMap((prev) => ({
-                    ...prev,
-                    [item.seriesId as number]: { seasonsCount, episodesCount },
-                }));
+                setSeriesStatsMap((prev) => ({ ...prev, [item.seriesId as number]: { seasonsCount, episodesCount } }));
 
-                // Load episode-level progress for the series detail modal
-                const allEpisodeIds = Object.values(data.episodesBySeason)
-                    .flat()
-                    .map((ep) => String(ep.id));
+                const allEpisodeIds = Object.values(data.episodesBySeason).flat().map((ep) => String(ep.id));
                 if (allEpisodeIds.length > 0) {
                     fetchProgress(token, accountId, 'series_episode', allEpisodeIds)
                         .then((result) => {
                             const map: EpisodeProgressMap = {};
                             for (const entry of result.items) {
-                                map[entry.itemId] = {
-                                    currentTime: entry.currentTime,
-                                    totalDuration: entry.totalDuration,
-                                    isWatched: entry.isWatched,
-                                    needsTranscode: entry.needsTranscode,
-                                };
+                                map[entry.itemId] = { currentTime: entry.currentTime, totalDuration: entry.totalDuration, isWatched: entry.isWatched, needsTranscode: entry.needsTranscode };
                             }
                             setEpisodeProgressMap(map);
                         })
@@ -1035,7 +904,7 @@ export default function App() {
                 setSeriesDetailLoading(false);
             }
         },
-        [token, accountId]
+        [token, accountId, navigate, location.pathname]
     );
 
     const handlePlay = useCallback(
@@ -1052,16 +921,12 @@ export default function App() {
                     const prog = seriesProgressMap[progressKey];
 
                     if (!prog?.lastEpisode) {
-                        // No progress yet -> open detail modal (default behaviour)
                         await handleOpenSeriesDetails(item);
                         return;
                     }
 
                     const { lastEpisode } = prog;
-                    const remaining =
-                        lastEpisode.totalDuration > 0
-                            ? lastEpisode.totalDuration - lastEpisode.currentTime
-                            : Infinity;
+                    const remaining = lastEpisode.totalDuration > 0 ? lastEpisode.totalDuration - lastEpisode.currentTime : Infinity;
 
                     setSeriesDetailLoading(false);
                     let seriesData: SeriesInfoResponse;
@@ -1079,19 +944,12 @@ export default function App() {
                     let startTimeSec: number | undefined = undefined;
 
                     if (lastEpisode.isWatched || remaining <= 10) {
-                        // Find and play next episode
-                        targetEpisode = findNextEpisode(
-                            seriesData,
-                            lastEpisode.seasonNumber ?? 1,
-                            lastEpisode.episodeNumber ?? 1
-                        );
+                        targetEpisode = findNextEpisode(seriesData, lastEpisode.seasonNumber ?? 1, lastEpisode.episodeNumber ?? 1);
                         if (!targetEpisode) {
-                            // Series finished -> open modal
                             await handleOpenSeriesDetails(item);
                             return;
                         }
                     } else {
-                        // Resume the in-progress episode
                         const episodeIdNum = Number(lastEpisode.episodeId);
                         for (const episodes of Object.values(seriesData.episodesBySeason)) {
                             const found = episodes.find((ep) => ep.id === episodeIdNum);
@@ -1109,44 +967,17 @@ export default function App() {
 
                     const rawSources = await resolvePlaybackSources(
                         {
-                            id: String(targetEpisode.id),
-                            title: targetEpisode.title,
-                            categoryId: '',
-                            poster: targetEpisode.poster,
-                            description: null,
-                            genre: null,
-                            year: null,
-                            rating: targetEpisode.rating ? String(targetEpisode.rating) : null,
-                            containerExtension: targetEpisode.containerExtension,
-                            streamId: null,
-                            seriesId: targetEpisode.id,
+                            id: String(targetEpisode.id), title: targetEpisode.title, categoryId: '', poster: targetEpisode.poster, description: null, genre: null, year: null,
+                            rating: targetEpisode.rating ? String(targetEpisode.rating) : null, containerExtension: targetEpisode.containerExtension, streamId: null, seriesId: targetEpisode.id,
                         },
-                        'series',
-                        targetEpisode.id,
-                        {
-                            mediaTitle: targetEpisode.title,
-                            seriesTitle: seriesData.info.name,
-                            seasonNumber: targetEpisode.seasonNumber,
-                            episodeNumber: targetEpisode.episodeNumber,
-                        }
+                        'series', targetEpisode.id,
+                        { mediaTitle: targetEpisode.title, seriesTitle: seriesData.info.name, seasonNumber: targetEpisode.seasonNumber, episodeNumber: targetEpisode.episodeNumber }
                     );
 
-                    // If this episode previously needed transcode, skip straight to it.
-                    const epNeedsTranscode =
-                        lastEpisode.needsTranscode ||
-                        (episodeProgressMap[lastEpisode.episodeId]?.needsTranscode ?? false);
-                    const sources = epNeedsTranscode
-                        ? addSeekToTranscodeSources(reorderWithTranscodeFirst(rawSources), startTimeSec)
-                        : rawSources;
+                    const epNeedsTranscode = lastEpisode.needsTranscode || (episodeProgressMap[lastEpisode.episodeId]?.needsTranscode ?? false);
+                    const sources = epNeedsTranscode ? addSeekToTranscodeSources(reorderWithTranscodeFirst(rawSources), startTimeSec) : rawSources;
 
-                    currentlyPlayingRef.current = {
-                        type: 'series_episode',
-                        itemId: String(targetEpisode.id),
-                        accountId,
-                        seriesId: String(item.seriesId),
-                        seasonNumber: targetEpisode.seasonNumber,
-                        episodeNumber: targetEpisode.episodeNumber,
-                    };
+                    currentlyPlayingRef.current = { type: 'series_episode', itemId: String(targetEpisode.id), accountId, seriesId: String(item.seriesId), seasonNumber: targetEpisode.seasonNumber, episodeNumber: targetEpisode.episodeNumber };
                     setCurrentSeriesPlayContext({ seriesData, currentEpisode: targetEpisode });
                     setPlayerStartTime(startTimeSec);
                     setPlayerRealDuration(targetEpisode.durationSeconds ?? undefined);
@@ -1159,24 +990,10 @@ export default function App() {
                 if (!streamId) return;
 
                 const vodProg = vodProgressMap[`${accountId}:${item.id}`];
-                const vodStartTimeSec =
-                    vodProg && !vodProg.isWatched && vodProg.currentTime > 0
-                        ? vodProg.currentTime
-                        : undefined;
-                const rawVodSources = await resolvePlaybackSources(item, activeSection, streamId, {
-                    mediaTitle: item.title,
-                });
-                const vodSources = vodProg?.needsTranscode
-                    ? addSeekToTranscodeSources(reorderWithTranscodeFirst(rawVodSources), vodStartTimeSec)
-                    : rawVodSources;
-                currentlyPlayingRef.current =
-                    activeSection === 'live'
-                        ? null
-                        : {
-                              type: 'vod',
-                              itemId: item.id,
-                              accountId,
-                          };
+                const vodStartTimeSec = vodProg && !vodProg.isWatched && vodProg.currentTime > 0 ? vodProg.currentTime : undefined;
+                const rawVodSources = await resolvePlaybackSources(item, activeSection, streamId, { mediaTitle: item.title });
+                const vodSources = vodProg?.needsTranscode ? addSeekToTranscodeSources(reorderWithTranscodeFirst(rawVodSources), vodStartTimeSec) : rawVodSources;
+                currentlyPlayingRef.current = activeSection === 'live' ? null : { type: 'vod', itemId: item.id, accountId };
                 setCurrentSeriesPlayContext(null);
                 setPlayerStartTime(vodStartTimeSec);
                 const providerDuration = item.durationSeconds && item.durationSeconds > 0 ? item.durationSeconds : undefined;
@@ -1195,56 +1012,29 @@ export default function App() {
             if (!token || !accountId) return;
 
             try {
-                // Resume from saved position if episode is in progress
                 const epProg = episodeProgressMap[String(episode.id)];
-                const startTimeSec =
-                    epProg && !epProg.isWatched && epProg.currentTime > 0
-                        ? epProg.currentTime
-                        : undefined;
+                const startTimeSec = epProg && !epProg.isWatched && epProg.currentTime > 0 ? epProg.currentTime : undefined;
 
                 const rawSources = await resolvePlaybackSources(
                     {
-                        id: String(episode.id),
-                        title: episode.title,
-                        categoryId: '',
-                        poster: episode.poster,
-                        description: null,
-                        genre: null,
-                        year: null,
-                        rating: episode.rating ? String(episode.rating) : null,
-                        containerExtension: episode.containerExtension,
-                        streamId: null,
-                        seriesId: episode.id,
+                        id: String(episode.id), title: episode.title, categoryId: '', poster: episode.poster, description: null, genre: null, year: null,
+                        rating: episode.rating ? String(episode.rating) : null, containerExtension: episode.containerExtension, streamId: null, seriesId: episode.id,
                     },
-                    'series',
-                    episode.id,
-                    {
-                        mediaTitle: episode.title,
-                        seriesTitle: seriesDetailData?.info.name ?? undefined,
-                        seasonNumber: episode.seasonNumber,
-                        episodeNumber: episode.episodeNumber,
-                    }
+                    'series', episode.id,
+                    { mediaTitle: episode.title, seriesTitle: seriesDetailData?.info.name ?? undefined, seasonNumber: episode.seasonNumber, episodeNumber: episode.episodeNumber }
                 );
 
-                const sources = epProg?.needsTranscode
-                    ? addSeekToTranscodeSources(reorderWithTranscodeFirst(rawSources), startTimeSec)
-                    : rawSources;
+                const sources = epProg?.needsTranscode ? addSeekToTranscodeSources(reorderWithTranscodeFirst(rawSources), startTimeSec) : rawSources;
 
                 currentlyPlayingRef.current = {
-                    type: 'series_episode',
-                    itemId: String(episode.id),
-                    accountId,
+                    type: 'series_episode', itemId: String(episode.id), accountId,
                     seriesId: seriesDetailItemId !== null ? String(seriesDetailItemId) : undefined,
-                    seasonNumber: episode.seasonNumber,
-                    episodeNumber: episode.episodeNumber,
+                    seasonNumber: episode.seasonNumber, episodeNumber: episode.episodeNumber,
                 };
-                setCurrentSeriesPlayContext(
-                    seriesDetailData ? { seriesData: seriesDetailData, currentEpisode: episode } : null
-                );
+                setCurrentSeriesPlayContext(seriesDetailData ? { seriesData: seriesDetailData, currentEpisode: episode } : null);
                 setPlayerStartTime(startTimeSec);
                 setPlayerRealDuration(episode.durationSeconds ?? undefined);
                 needsTranscodeFlagRef.current = false;
-                setSeriesDetailOpen(false);
                 openPlayer(episode.title, sources);
             } catch (error) {
                 console.error('Episode playback start failed', error);
@@ -1313,23 +1103,16 @@ export default function App() {
             if (!token || !accountId || !recordingsStreamId || !epgItem.start) return;
             const recordingStart = epgItem.start;
 
-            const duration =
-                epgItem.startTimestamp && epgItem.stopTimestamp
-                    ? Math.max(1, Math.round((epgItem.stopTimestamp - epgItem.startTimestamp) / 60))
-                    : 60;
+            const duration = epgItem.startTimestamp && epgItem.stopTimestamp
+                ? Math.max(1, Math.round((epgItem.stopTimestamp - epgItem.startTimestamp) / 60))
+                : 60;
 
             try {
                 const replayExtensions = ['ts', 'm3u8', 'mp4'];
                 const replayUrls = await Promise.all(
                     replayExtensions.map(async (extension) => {
                         try {
-                            const replay = await fetchReplayUrl(token, {
-                                accountId,
-                                streamId: recordingsStreamId,
-                                start: recordingStart,
-                                durationMinutes: duration,
-                                containerExtension: extension,
-                            });
+                            const replay = await fetchReplayUrl(token, { accountId, streamId: recordingsStreamId, start: recordingStart, durationMinutes: duration, containerExtension: extension });
                             return replay.url;
                         } catch {
                             return null;
@@ -1356,8 +1139,25 @@ export default function App() {
         setSelectedCategories((prev) => ({ ...prev, [activeSection]: categoryId }));
     };
 
-    const playerKeyboardEnabled =
-        playerOpen && !showIptvDialog && !seriesDetailOpen && !recordingsOpen && !scheduleOpen;
+    const playerKeyboardEnabled = playerOpen && !showIptvDialog && !seriesDetailOpen && !recordingsOpen && !scheduleOpen;
+
+    const contextValue: AppContextValue = {
+        reducedMotion, setReducedMotion, isWeakDevice,
+        token, accounts, accountId, handleSwitchAccount, handleLogout,
+        isDarkMode, setIsDarkMode,
+        activeSection, setActiveSection, categoriesBySection, currentCategories, currentCategory, handleCategoryChange,
+        searchQuery, setSearchQuery,
+        items, enrichedItems, featuredItem, hasMore, isLoadingContent, handleLoadMore,
+        favoritesBySection, toggleFavorite,
+        preferences, updatePreferences, handleClearWatchHistory,
+        vodProgressMap, seriesProgressMap, episodeProgressMap, seriesStatsMap,
+        handlePlay, handlePlayEpisode, handleOpenSeriesDetails, seriesDetailData, seriesDetailLoading, seriesDetailItemId,
+        handleOpenSchedule, handleOpenRecordings,
+        scheduleOpen, scheduleTitle, scheduleItems, scheduleLoading, setScheduleOpen,
+        recordingsOpen, recordingsTitle, recordingsItems, recordingsLoading, setRecordingsOpen, handlePlayRecording,
+        integrations, refreshIntegrations,
+        showIptvDialog, setShowIptvDialog, isLoadingIptvSetup, iptvSetupError, handleAddIptvAccount,
+    };
 
     if (!token) {
         return (
@@ -1369,176 +1169,103 @@ export default function App() {
 
     return (
         <MotionConfig reducedMotion={reducedMotion ? 'always' : 'never'}>
-        <div className={`min-h-screen transition-colors duration-300 ${isDarkMode ? 'bg-black text-white' : 'bg-gray-50 text-gray-900'}`}>
-            <div
-                className={`fixed inset-0 pointer-events-none transition-colors duration-300 ${isDarkMode ? 'bg-gradient-to-br from-red-900/20 via-black to-orange-900/20' : 'bg-gradient-to-br from-red-50 via-white to-orange-50'
-                    }`}
-            />
+            <div className={`min-h-screen transition-colors duration-300 ${isDarkMode ? 'bg-black text-white' : 'bg-gray-50 text-gray-900'}`}>
+                <div
+                    className={`fixed inset-0 pointer-events-none transition-colors duration-300 ${isDarkMode ? 'bg-gradient-to-br from-red-900/20 via-black to-orange-900/20' : 'bg-gradient-to-br from-red-50 via-white to-orange-50'}`}
+                />
 
-            <Header
-                activeSection={activeSection}
-                onSectionChange={setActiveSection}
-                searchQuery={searchQuery}
-                onSearchChange={setSearchQuery}
-                onLogout={handleLogout}
-                isDarkMode={isDarkMode}
-                onToggleDarkMode={() => setIsDarkMode(!isDarkMode)}
-                accounts={accounts}
-                activeAccountId={accountId}
-                onSwitchAccount={handleSwitchAccount}
-                onAddAccount={() => setShowIptvDialog(true)}
-                preferences={preferences}
-                onUpdatePreferences={updatePreferences}
-                onClearWatchHistory={handleClearWatchHistory}
-                reducedMotion={reducedMotion}
-                onToggleReducedMotion={setReducedMotion}
-                isWeakDevice={isWeakDevice}
-            />
+                <Header
+                    activeSection={activeSection}
+                    onSectionChange={(section) => {
+                        setActiveSection(section);
+                        navigate(section === 'live' ? '/live' : section === 'films' ? '/films' : '/series');
+                    }}
+                    searchQuery={searchQuery}
+                    onSearchChange={(value) => {
+                        setSearchQuery(value);
+                        if (value && location.pathname !== '/search') navigate('/search');
+                    }}
+                    onLogout={handleLogout}
+                    isDarkMode={isDarkMode}
+                    onToggleDarkMode={() => setIsDarkMode(!isDarkMode)}
+                    accounts={accounts}
+                    activeAccountId={accountId}
+                    onSwitchAccount={handleSwitchAccount}
+                    onAddAccount={() => setShowIptvDialog(true)}
+                    preferences={preferences}
+                    onUpdatePreferences={updatePreferences}
+                    onClearWatchHistory={handleClearWatchHistory}
+                    reducedMotion={reducedMotion}
+                    onToggleReducedMotion={setReducedMotion}
+                    isWeakDevice={isWeakDevice}
+                    requestsEnabled={!!(integrations?.radarr || integrations?.sonarr)}
+                />
 
-            <main className="relative">
-                <AnimatePresence mode="wait">
-                    <motion.div
-                        key={activeSection}
-                        initial={{ opacity: 0, y: 20 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        exit={{ opacity: 0, y: -20 }}
-                        transition={{ duration: 0.3 }}
-                    >
-                        <Hero
-                            type={activeSection}
-                            isDarkMode={isDarkMode}
-                            featuredItem={featuredItem}
-                            token={token}
-                            onPlay={() => {
-                                if (featuredItem) handlePlay(featuredItem);
-                            }}
-                            onInfo={() => {
-                                if (activeSection === 'series' && featuredItem) {
-                                    handleOpenSeriesDetails(featuredItem);
-                                }
-                            }}
-                        />
+                <main className="relative">
+                    <AnimatePresence mode="wait">
+                        <motion.div
+                            key={location.pathname}
+                            initial={{ opacity: 0, y: 20 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            exit={{ opacity: 0, y: -20 }}
+                            transition={{ duration: 0.3 }}
+                        >
+                            <AppContext.Provider value={contextValue}>
+                                <Outlet />
+                            </AppContext.Provider>
+                        </motion.div>
+                    </AnimatePresence>
+                </main>
 
-                        <div className="max-w-[1920px] mx-auto px-4 sm:px-6 lg:px-8 mt-8">
-                            <CategoryTabs
-                                categories={currentCategories}
-                                selectedCategory={currentCategory}
-                                onCategoryChange={handleCategoryChange}
-                                isDarkMode={isDarkMode}
-                            />
-                        </div>
+                <AppFooter isDarkMode={isDarkMode} />
 
-                        <div className="max-w-[1920px] mx-auto px-4 sm:px-6 lg:px-8 py-12">
-                            <PaginatedContentGrid
-                                section={activeSection}
-                                items={enrichedItems}
-                                isDarkMode={isDarkMode}
-                                isLoading={isLoadingContent}
-                                hasMore={hasMore}
-                                onLoadMore={handleLoadMore}
-                                onPlay={handlePlay}
-                                onOpenDetails={activeSection === 'series' ? handleOpenSeriesDetails : undefined}
-                                onOpenSchedule={activeSection === 'live' ? handleOpenSchedule : undefined}
-                                onOpenRecordings={activeSection === 'live' ? handleOpenRecordings : undefined}
-                                isFavoritesView={currentCategory === 'favorites'}
-                                favoriteIds={favoritesBySection[activeSection]}
-                                onToggleFavorite={toggleFavorite}
-                                vodProgressMap={vodProgressMap}
-                                seriesProgressMap={seriesProgressMap}
-                                accountId={accountId}
-                            />
-                        </div>
-                    </motion.div>
-                </AnimatePresence>
-            </main>
+                <VideoPlayerModal
+                    open={playerOpen}
+                    title={playerTitle}
+                    streamUrl={playerUrl}
+                    streamSources={playerSources}
+                    startTime={playerStartTime}
+                    onProgress={handlePlayerProgress}
+                    onEnded={handlePlayerEnded}
+                    autoplay={preferences.autoplay}
+                    nextEpisodeTitle={
+                        currentSeriesPlayContext
+                            ? (() => {
+                                  const next = findNextEpisode(currentSeriesPlayContext.seriesData, currentSeriesPlayContext.currentEpisode.seasonNumber, currentSeriesPlayContext.currentEpisode.episodeNumber);
+                                  return next ? `S${String(next.seasonNumber).padStart(2, '0')}E${String(next.episodeNumber).padStart(2, '0')} • ${next.title}` : undefined;
+                              })()
+                            : undefined
+                    }
+                    onNextEpisode={handleNextEpisode}
+                    onPreviousEpisode={handlePreviousEpisode}
+                    realDuration={playerRealDuration}
+                    onTranscodeFallback={handleTranscodeFallback}
+                    isLive={playerIsLive}
+                    keyboardEnabled={playerKeyboardEnabled}
+                    onClose={() => {
+                        setPlayerOpen(false);
+                        setPlayerUrl(null);
+                        setPlayerSources([]);
+                        setPlayerStartTime(undefined);
+                        setPlayerRealDuration(undefined);
+                        setPlayerIsLive(false);
+                        needsTranscodeFlagRef.current = false;
+                        currentlyPlayingRef.current = null;
+                    }}
+                />
 
-            <AppFooter isDarkMode={isDarkMode} />
+                <LiveScheduleDialog open={scheduleOpen} title={scheduleTitle} items={scheduleItems} isLoading={scheduleLoading} onClose={() => setScheduleOpen(false)} />
 
-            <VideoPlayerModal
-                open={playerOpen}
-                title={playerTitle}
-                streamUrl={playerUrl}
-                streamSources={playerSources}
-                startTime={playerStartTime}
-                onProgress={handlePlayerProgress}
-                onEnded={handlePlayerEnded}
-                autoplay={preferences.autoplay}
-                nextEpisodeTitle={
-                    currentSeriesPlayContext
-                        ? (() => {
-                              const next = findNextEpisode(
-                                  currentSeriesPlayContext.seriesData,
-                                  currentSeriesPlayContext.currentEpisode.seasonNumber,
-                                  currentSeriesPlayContext.currentEpisode.episodeNumber
-                              );
-                              return next
-                                  ? `S${String(next.seasonNumber).padStart(2, '0')}E${String(next.episodeNumber).padStart(2, '0')} • ${next.title}`
-                                  : undefined;
-                          })()
-                        : undefined
-                }
-                onNextEpisode={handleNextEpisode}
-                onPreviousEpisode={handlePreviousEpisode}
-                realDuration={playerRealDuration}
-                onTranscodeFallback={handleTranscodeFallback}
-                isLive={playerIsLive}
-                keyboardEnabled={playerKeyboardEnabled}
-                onClose={() => {
-                    setPlayerOpen(false);
-                    setPlayerUrl(null);
-                    setPlayerSources([]);
-                    setPlayerStartTime(undefined);
-                    setPlayerRealDuration(undefined);
-                    setPlayerIsLive(false);
-                    needsTranscodeFlagRef.current = false;
-                    currentlyPlayingRef.current = null;
-                }}
-            />
+                <LiveRecordingsDialog open={recordingsOpen} title={recordingsTitle} items={recordingsItems} isLoading={recordingsLoading} onClose={() => setRecordingsOpen(false)} onPlayRecording={handlePlayRecording} />
 
-            <SeriesDetailModal
-                open={seriesDetailOpen}
-                isDarkMode={isDarkMode}
-                data={seriesDetailData}
-                episodeProgress={episodeProgressMap}
-                onClose={() => {
-                    setSeriesDetailOpen(false);
-                    setSeriesDetailData(null);
-                    setSeriesDetailItemId(null);
-                }}
-                onPlayEpisode={handlePlayEpisode}
-            />
-
-            <LiveScheduleDialog
-                open={scheduleOpen}
-                title={scheduleTitle}
-                items={scheduleItems}
-                isLoading={scheduleLoading}
-                onClose={() => setScheduleOpen(false)}
-            />
-
-            <LiveRecordingsDialog
-                open={recordingsOpen}
-                title={recordingsTitle}
-                items={recordingsItems}
-                isLoading={recordingsLoading}
-                onClose={() => setRecordingsOpen(false)}
-                onPlayRecording={handlePlayRecording}
-            />
-
-            {seriesDetailOpen && seriesDetailLoading && (
-                <div className="fixed inset-0 z-[111] pointer-events-none flex items-center justify-center">
-                    <div className="px-4 py-2 rounded-lg bg-black/80 text-white text-sm">Chargement des détails de la série...</div>
-                </div>
-            )}
-
-            <IptvCredentialsDialog
-                open={showIptvDialog}
-                isLoading={isLoadingIptvSetup}
-                error={iptvSetupError}
-                onClose={accountId ? () => setShowIptvDialog(false) : undefined}
-                onSubmit={handleAddIptvAccount}
-            />
-        </div>
+                <IptvCredentialsDialog
+                    open={showIptvDialog}
+                    isLoading={isLoadingIptvSetup}
+                    error={iptvSetupError}
+                    onClose={accountId ? () => setShowIptvDialog(false) : undefined}
+                    onSubmit={handleAddIptvAccount}
+                />
+            </div>
         </MotionConfig>
     );
 }

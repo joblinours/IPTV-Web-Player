@@ -1,6 +1,7 @@
 import { useState } from 'react';
+import { useNavigate } from 'react-router';
 import { motion, AnimatePresence } from 'motion/react';
-import { Search, Settings, LogOut, X, Menu, Sun, Moon } from 'lucide-react';
+import { Search, Settings, LogOut, X, Menu, Sun, Moon, Download } from 'lucide-react';
 import { SettingsDialog } from './SettingsDialog';
 import type { IptvAccount, UserPreferences } from '../lib/api';
 
@@ -22,6 +23,7 @@ interface HeaderProps {
   reducedMotion?: boolean;
   onToggleReducedMotion?: (value: boolean) => void;
   isWeakDevice?: boolean;
+  requestsEnabled?: boolean;
 }
 
 export function Header({
@@ -42,7 +44,9 @@ export function Header({
   reducedMotion,
   onToggleReducedMotion,
   isWeakDevice,
+  requestsEnabled,
 }: HeaderProps) {
+  const navigate = useNavigate();
   const [searchOpen, setSearchOpen] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -118,6 +122,17 @@ export function Header({
                   </span>
                 </motion.button>
               ))}
+              {requestsEnabled && (
+                <motion.button
+                  onClick={() => navigate('/requests')}
+                  className={`relative px-4 py-2.5 rounded-xl transition-all duration-300 inline-flex items-center gap-1.5 ${isDarkMode ? 'text-gray-400 hover:text-white' : 'text-gray-600 hover:text-gray-900'}`}
+                  whileHover={{ scale: 1.05 }}
+                  whileTap={{ scale: 0.95 }}
+                >
+                  <Download size={16} />
+                  <span className="font-medium text-sm">Demandes</span>
+                </motion.button>
+              )}
             </nav>
 
             {/* Actions */}
@@ -237,6 +252,17 @@ export function Header({
                       {section === 'live' ? 'Live' : section === 'films' ? 'Films' : 'Séries'}
                     </button>
                   ))}
+                  {requestsEnabled && (
+                    <button
+                      onClick={() => {
+                        navigate('/requests');
+                        setMobileMenuOpen(false);
+                      }}
+                      className={`w-full text-left px-4 py-3 rounded-xl transition-colors ${isDarkMode ? 'text-gray-400 hover:bg-white/5' : 'text-gray-600 hover:bg-gray-100'}`}
+                    >
+                      Demandes
+                    </button>
+                  )}
                   <div className={`pt-2 border-t space-y-2 ${isDarkMode ? 'border-white/10' : 'border-gray-200'}`}>
                     <button
                       onClick={onToggleDarkMode}

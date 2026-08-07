@@ -1,18 +1,232 @@
 services:
+  mysql:
+    image: mysql:8.4
+    container_name: iptv-mysql
+    restart: unless-stopped
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --innodb-buffer-pool-size=128M
+      --performance-schema=OFF
+      --skip-name-resolve
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-streamhub}
+      MYSQL_USER: ${MYSQL_USER:-streamhub}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", 'mysqladmin ping -h 127.0.0.1 -u root -p"$$MYSQL_ROOT_PASSWORD" --silent']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 45s
+    networks:
+      - iptv-net
+    # No published port — internal only. Add 127.0.0.1:3306:3306 temporarily
+    # if you need a host-side `mysql` client.
+
+  redis:
+    image: redis:7-alpine
+    container_name: iptv-redis
+    restart: unless-stopped
+    # noeviction is mandatory: BullMQ (queue db) can silently corrupt its
+    # internal structures if Redis evicts its keys under memory pressure.
+    command: >
+      redis-server
+      --appendonly yes --appendfsync everysec
+      --maxmemory 512mb --maxmemory-policy noeviction
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    networks:
+      - iptv-net
+
+  jellyfin:
+    image: jellyfin/jellyfin:10.10.7
+    container_name: iptv-jellyfin
+    restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"
+    environment:
+      - TZ=${TZ:-Europe/Paris}
+      - JELLYFIN_PublishedServerUrl=${JELLYFIN_PUBLISHED_URL:-http://192.168.1.13:8096}
+    volumes:
+      - jellyfin_config:/config
+      - jellyfin_cache:/cache
+      - ${MEDIA_ROOT:-/mnt/zfs-data-mirror/media}:/media:ro
+    ports:
+      - "8096:8096" # LAN-only: first-run wizard + admin UI. The browser
+                    # never talks to Jellyfin in normal use — StreamHub
+                    # proxies images/video through the backend.
+    # devices: ["/dev/dri:/dev/dri"]  # uncomment for VAAPI hardware transcoding
+    networks:
+      - iptv-net
+
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: iptv-radarr
+    restart: unless-stopped
+    environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - TZ=${TZ:-Europe/Paris}
+    volumes:
+      - radarr_config:/config
+      - ${MEDIA_ROOT:-/mnt/zfs-data-mirror/media}:/media
+    ports:
+      - "7878:7878"
+    depends_on:
+      qbittorrent:
+        condition: service_started
+    networks:
+      - iptv-net
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: iptv-sonarr
+    restart: unless-stopped
+    environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - TZ=${TZ:-Europe/Paris}
+    volumes:
+      - sonarr_config:/config
+      - ${MEDIA_ROOT:-/mnt/zfs-data-mirror/media}:/media
+    ports:
+      - "8989:8989"
+    depends_on:
+      qbittorrent:
+        condition: service_started
+    networks:
+      - iptv-net
+
+  # Indexer manager: add trackers (e.g. C411, or free public indexers) here
+  # ONCE, then sync them out to Radarr/Sonarr automatically via Prowlarr's
+  # "Apps" feature — no need to configure each indexer separately in every
+  # *arr app. 100%-free-of-paid-services friendly: works the same whether
+  # the indexers behind it are private trackers or public ones.
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: iptv-prowlarr
+    restart: unless-stopped
+    environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - TZ=${TZ:-Europe/Paris}
+    volumes:
+      - prowlarr_config:/config
+    ports:
+      - "9696:9696"
+    networks:
+      - iptv-net
+
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: iptv-qbittorrent
+    restart: unless-stopped
+    environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - TZ=${TZ:-Europe/Paris}
+      - WEBUI_PORT=8090
+    volumes:
+      - qbittorrent_config:/config
+      - ${MEDIA_ROOT:-/mnt/zfs-data-mirror/media}:/media
+    ports:
+      - "8090:8090" # WebUI (8080 is already taken by the frontend)
+      - "6881:6881"
+      - "6881:6881/udp" # BitTorrent peer traffic
+    networks:
+      - iptv-net
+
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: iptv-backend
     restart: unless-stopped
-    env_file:
-      - ./backend/.env
+    # No .env file, by design: every variable below is resolved from the
+    # shell/systemd environment `docker compose` runs in (Compose reads
+    # `${VAR}` from the process environment when no .env file is present).
+    # Required secrets use `${VAR:?message}` so `docker compose up` refuses
+    # to start with a clear error instead of booting insecurely. Export
+    # these however you like on the server (systemd `EnvironmentFile=`, a
+    # shell profile, your process manager's own secret store, ...) — just
+    # never as a file that lives in this repo.
     environment:
-      - NODE_ENV=production
-      - DB_PATH=/data/app.db
-      - CORS_ORIGIN=${CORS_ORIGIN:-http://localhost:8080}
+      NODE_ENV: production
+      PORT: 4000
+      HOST: 0.0.0.0
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080}
+
+      # Required — copy verbatim between deploys, never regenerate on an
+      # existing deployment (see CUTOVER.md, "le piège n°1").
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET (export it, do not put it in a file in this repo)}
+      APP_ENCRYPTION_SECRET: ${APP_ENCRYPTION_SECRET:?set APP_ENCRYPTION_SECRET, 32+ chars, copy verbatim between deploys}
+
+      # MySQL — StreamHub's own data only.
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-streamhub}
+      MYSQL_USER: ${MYSQL_USER:-streamhub}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD}
+      MYSQL_POOL_SIZE: 10
+      # Only read by the one-off migrate-sqlite-to-mysql.js script.
+      LEGACY_SQLITE_PATH: /data-legacy/app.db
+
+      # Redis — cache db0 + BullMQ queue db1.
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_CACHE_DB: 0
+      REDIS_QUEUE_DB: 1
+
+      # Caching TTLs (seconds).
+      XTREAM_CATALOG_TTL_SECONDS: 900
+      XTREAM_SERIES_TTL_SECONDS: 3600
+      TMDB_CACHE_TTL_SECONDS: 2592000
+
+      # Background workers (BullMQ) — see backend/src/worker.ts for the
+      # escape hatch to split these into their own service later.
+      RUN_WORKERS: "true"
+      WORKER_CONCURRENCY: 2
+
+      STREAM_PROXY_TIMEOUT_MS: 20000
+
+      # Optional integrations — every one of these degrades to disabled
+      # when empty, never a hard failure at boot (see backend/src/config.ts).
+      TMDB_API_KEY: ${TMDB_API_KEY:-}
+
+      JELLYFIN_URL: http://jellyfin:8096
+      JELLYFIN_API_KEY: ${JELLYFIN_API_KEY:-}
+      JELLYFIN_USER_ID: ${JELLYFIN_USER_ID:-}
+      JELLYFIN_SYNC_INTERVAL_MS: 900000
+
+      RADARR_URL: http://radarr:7878
+      RADARR_API_KEY: ${RADARR_API_KEY:-}
+      RADARR_ROOT_FOLDER: /media/movies
+      RADARR_QUALITY_PROFILE_ID: ${RADARR_QUALITY_PROFILE_ID:-0}
+
+      SONARR_URL: http://sonarr:8989
+      SONARR_API_KEY: ${SONARR_API_KEY:-}
+      # Matches the existing host folder name (/mnt/zfs-data-mirror/media/series),
+      # not "tv" — the whole media root is bind-mounted as-is, see docker-compose.yml.
+      SONARR_ROOT_FOLDER: /media/series
+      SONARR_QUALITY_PROFILE_ID: ${SONARR_QUALITY_PROFILE_ID:-0}
+
+      # Embedded in the Radarr/Sonarr webhook URLs (openssl rand -hex 32).
+      REQUESTS_WEBHOOK_SECRET: ${REQUESTS_WEBHOOK_SECRET:-}
     volumes:
-      - backend_data:/data
+      # Legacy SQLite volume, kept read-only for a rollback window after the
+      # MySQL cutover — do NOT remove this until you're confident the
+      # migration is good (see backend/src/scripts/migrate-sqlite-to-mysql.ts).
+      - backend_data:/data-legacy:ro
     expose:
       - "4000"
     healthcheck:
@@ -27,6 +241,14 @@ services:
       timeout: 5s
       retries: 5
       start_period: 15s
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # Deliberately NOT jellyfin/radarr/sonarr/prowlarr/qbittorrent — the
+      # IPTV player is the core product and must boot even if one of those
+      # is down or not configured yet. Integrations are env-gated at runtime.
     networks:
       - iptv-net
 
@@ -47,7 +269,25 @@ services:
       - iptv-net
 
 volumes:
-  backend_data:
+  # backend_data/mysql_data/redis_data/*_config stay as regular Docker-managed
+  # volumes (default Docker storage location) — only large media files live
+  # on the ZFS mirror, via the bind mount below, not these.
+  backend_data: {} # legacy SQLite — DO NOT REMOVE during/shortly after the MySQL cutover
+  mysql_data: {}
+  redis_data: {}
+  jellyfin_config: {}
+  jellyfin_cache: {}
+  radarr_config: {}
+  sonarr_config: {}
+  prowlarr_config: {}
+  qbittorrent_config: {}
+  # No `media` entry here anymore: it's a bind mount (${MEDIA_ROOT}, see the
+  # jellyfin/radarr/sonarr/qbittorrent services above), not a Docker-managed
+  # volume — it lives on the host's ZFS mirror at /mnt/zfs-data-mirror/media
+  # (movies/, series/, downloads/) so it survives independently of Docker
+  # and benefits from the mirror's redundancy. Same underlying filesystem
+  # for downloads/complete and movies/series is what makes Radarr/Sonarr's
+  # imports instant hardlinks instead of full-file copies.
 
 networks:
   iptv-net:
