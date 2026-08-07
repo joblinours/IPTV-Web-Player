@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { queryOne, execute, nowEpoch } from '../db.js';
+import { queryOne, queryAll, execute, nowEpoch } from '../db.js';
 import { encryptSecret } from '../crypto.js';
 import { env, jellyfinConfigured } from '../config.js';
 import type { CategoryItem, ContentType, EpgItem, SeriesInfoResponse } from '../types.js';
@@ -34,6 +34,18 @@ export async function loadSource(userId: number, sourceId: number): Promise<Medi
   return queryOne<MediaSourceRow>(
     'SELECT id, user_id, kind, name, server_url, username, secret_enc FROM media_sources WHERE id = ? AND user_id = ?',
     [sourceId, userId]
+  );
+}
+
+/**
+ * Every media_sources row a user owns — the fan-out base for the merged
+ * catalog view (routes/catalog.ts) that folds Xtream and Jellyfin content
+ * into a single browsing surface instead of requiring an account switch.
+ */
+export async function loadAllSources(userId: number): Promise<MediaSourceRow[]> {
+  return queryAll<MediaSourceRow>(
+    'SELECT id, user_id, kind, name, server_url, username, secret_enc FROM media_sources WHERE user_id = ? ORDER BY id ASC',
+    [userId]
   );
 }
 

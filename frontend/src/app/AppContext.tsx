@@ -13,7 +13,7 @@ import type {
     IntegrationsStatus,
 } from './lib/api';
 
-export type SeriesStatsMap = Record<number, { seasonsCount: number; episodesCount: number }>;
+export type SeriesStatsMap = Record<number | string, { seasonsCount: number; episodesCount: number }>;
 export type VodProgressMap = Record<string, ProgressEntry>;
 export type SeriesProgressMap = Record<string, SeriesProgressSummary>;
 export type EpisodeProgressMap = Record<string, { currentTime: number; totalDuration: number; isWatched: boolean; needsTranscode: boolean }>;
@@ -74,7 +74,7 @@ export interface AppContextValue {
     handleOpenSeriesDetails: (item: ContentItem) => void;
     seriesDetailData: SeriesInfoResponse | null;
     seriesDetailLoading: boolean;
-    seriesDetailItemId: number | null;
+    seriesDetailItemId: number | string | null;
 
     handleOpenSchedule: (item: ContentItem) => void;
     handleOpenRecordings: (item: ContentItem) => void;

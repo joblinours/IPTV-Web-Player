@@ -33,6 +33,17 @@ export function computePagination(total: number, offset: number, limit: number) 
   };
 }
 
+// `${sourceId}:${itemId}` — the composite key every favorite/progress
+// lookup uses once more than one media_sources row can appear in a single
+// listing (merged mode, see routes/catalog.ts). A bare itemId is only
+// guaranteed unique within one source (an Xtream numeric stream id from one
+// account could coincide with another account's), so this is used even in
+// single-source mode for consistency — the caller builds the same key on
+// both sides regardless of how many sources are actually in play.
+export function favoriteKey(sourceId: number, itemId: string): string {
+  return `${sourceId}:${itemId}`;
+}
+
 /**
  * Source-agnostic filter + paginate, shared by every content provider
  * (Xtream, Jellyfin, ...) so `routes/catalog.ts` doesn't need to know how
@@ -47,7 +58,7 @@ export function filterAndPaginate(
   const filtered = items.filter((item) => {
     const categoryMatch =
       opts.categoryId === 'favorites'
-        ? opts.favoriteIds?.has(item.itemId) ?? false
+        ? opts.favoriteIds?.has(favoriteKey(item.sourceId, item.itemId)) ?? false
         : opts.categoryId === 'all' || item.categoryId === opts.categoryId;
     if (!categoryMatch) return false;
 

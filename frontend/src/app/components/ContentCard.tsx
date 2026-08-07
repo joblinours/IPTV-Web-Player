@@ -151,31 +151,7 @@ export function ContentCard({
           </div>
         )}
 
-        {/* Quick Play Button (shown on hover) */}
-        <AnimatePresence>
-          {isHovered && (
-            <motion.div
-              initial={{ opacity: 0, scale: 0.8 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.8 }}
-              className="absolute inset-0 flex items-center justify-center bg-black/40 backdrop-blur-sm"
-            >
-              <motion.button
-                whileHover={{ scale: 1.2 }}
-                whileTap={{ scale: 0.9 }}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onPlay?.();
-                }}
-                className="w-16 h-16 rounded-full bg-white/20 backdrop-blur-xl border-2 border-white/40 flex items-center justify-center group"
-              >
-                <Play size={28} fill="white" className="text-white ml-1" />
-              </motion.button>
-            </motion.div>
-          )}
-        </AnimatePresence>
-
-        {/* Bottom Info */}
+        {/* Bottom Info — default state, always visible, hidden behind the hover overlay below */}
         <div className="absolute bottom-0 left-0 right-0 p-4">
           <h3 className="text-white font-semibold mb-1 line-clamp-1">{title}</h3>
           <div className="flex items-center gap-2 text-xs text-gray-300">
@@ -193,127 +169,125 @@ export function ContentCard({
             </div>
           )}
         </div>
+
+        {/* Hover overlay: title/description/actions superimposed on the
+            thumbnail itself (was previously a separate block pushed below
+            the card, forcing a scroll to reach it — everything now stays
+            within the card's own bounds, `overflow-hidden` above clips it). */}
+        <AnimatePresence>
+          {isHovered && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.15 }}
+              className="absolute inset-0 flex flex-col justify-between p-4 bg-black/80 backdrop-blur-sm"
+            >
+              <div>
+                <h3 className="text-white font-semibold line-clamp-2">{title}</h3>
+                <div className="flex items-center gap-2 text-xs text-gray-300 mt-1">
+                  <span>{meta.primary}</span>
+                  <span className="w-1 h-1 bg-gray-500 rounded-full" />
+                  <span>{meta.secondary}</span>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <motion.button
+                  whileHover={{ scale: 1.05 }}
+                  whileTap={{ scale: 0.95 }}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onPlay?.();
+                  }}
+                  className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-white text-black rounded-lg font-semibold hover:bg-gray-200 transition-colors"
+                >
+                  <Play size={16} fill="currentColor" />
+                  <span className="text-sm">Lecture</span>
+                </motion.button>
+
+                <motion.button
+                  whileHover={{ scale: 1.1 }}
+                  whileTap={{ scale: 0.9 }}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onToggleFavorite?.();
+                  }}
+                  className="p-2 rounded-lg border bg-white/10 hover:bg-white/20 border-white/20 transition-colors"
+                  aria-label={isFavorite ? 'Retirer des favoris' : 'Ajouter aux favoris'}
+                >
+                  <Star size={16} className={isFavorite ? 'text-yellow-500' : 'text-white'} fill={isFavorite ? '#EAB308' : 'none'} />
+                </motion.button>
+
+                {type !== 'live' && onDetails && (
+                  <motion.button
+                    whileHover={{ scale: 1.1 }}
+                    whileTap={{ scale: 0.9 }}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onDetails();
+                    }}
+                    className="p-2 rounded-lg border bg-white/10 hover:bg-white/20 border-white/20 transition-colors"
+                  >
+                    <Plus size={16} className="text-white" />
+                  </motion.button>
+                )}
+
+                {type === 'live' && onOpenSchedule && (
+                  <motion.button
+                    whileHover={{ scale: 1.1 }}
+                    whileTap={{ scale: 0.9 }}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onOpenSchedule();
+                    }}
+                    className="p-2 rounded-lg border bg-white/10 hover:bg-white/20 border-white/20 transition-colors"
+                  >
+                    <Calendar size={16} className="text-white" />
+                  </motion.button>
+                )}
+
+                {type === 'live' && onOpenRecordings && (
+                  <motion.button
+                    whileHover={{ scale: 1.1 }}
+                    whileTap={{ scale: 0.9 }}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onOpenRecordings();
+                    }}
+                    className="p-2 rounded-lg border bg-white/10 hover:bg-white/20 border-white/20 transition-colors"
+                  >
+                    <ChevronDown size={16} className="text-white" />
+                  </motion.button>
+                )}
+              </div>
+
+              <div>
+                <p className="text-xs text-gray-300 line-clamp-3 mb-2">
+                  {description ?? 'Aucune description disponible.'}
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {type === 'live' ? (
+                    <span className="px-2 py-0.5 rounded text-[10px] bg-white/10 text-gray-200">
+                      {hasArchive ? 'Replay disponible' : 'Replay non disponible'}
+                    </span>
+                  ) : tags.length > 0 ? (
+                    tags.slice(0, 2).map((tag) => (
+                      <span key={tag} className="px-2 py-0.5 rounded text-[10px] bg-white/10 text-gray-200">
+                        {tag}
+                      </span>
+                    ))
+                  ) : (
+                    <span className="px-2 py-0.5 rounded text-[10px] bg-white/10 text-gray-200">
+                      Non classé
+                    </span>
+                  )}
+                </div>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </div>
-
-      {/* Expanded Info on Hover */}
-      <AnimatePresence>
-        {isHovered && (
-          <motion.div
-            initial={{ opacity: 0, y: -10 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -10 }}
-            transition={{ delay: 0.1 }}
-            className={`absolute top-full left-0 right-0 mt-2 p-4 backdrop-blur-xl rounded-xl border shadow-2xl ${isDarkMode
-              ? 'bg-gray-900/95 border-white/10'
-              : 'bg-white/95 border-gray-200'
-              }`}
-          >
-            <div className="flex items-center gap-2 mb-3">
-              <motion.button
-                whileHover={{ scale: 1.1 }}
-                whileTap={{ scale: 0.9 }}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onPlay?.();
-                }}
-                className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-white text-black rounded-lg font-semibold hover:bg-gray-200 transition-colors"
-              >
-                <Play size={16} fill="currentColor" />
-                <span className="text-sm">Lecture</span>
-              </motion.button>
-
-              <motion.button
-                whileHover={{ scale: 1.1 }}
-                whileTap={{ scale: 0.9 }}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onToggleFavorite?.();
-                }}
-                className={`p-2 rounded-lg border transition-colors ${isDarkMode
-                  ? 'bg-white/10 hover:bg-white/20 border-white/20'
-                  : 'bg-gray-100 hover:bg-gray-200 border-gray-300'
-                  }`}
-                aria-label={isFavorite ? 'Retirer des favoris' : 'Ajouter aux favoris'}
-              >
-                <Star size={18} className={isFavorite ? 'text-yellow-500' : ''} fill={isFavorite ? '#EAB308' : 'none'} />
-              </motion.button>
-
-              {type !== 'live' && onDetails && (
-                <motion.button
-                  whileHover={{ scale: 1.1 }}
-                  whileTap={{ scale: 0.9 }}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    onDetails();
-                  }}
-                  className={`p-2 rounded-lg border transition-colors ${isDarkMode
-                    ? 'bg-white/10 hover:bg-white/20 border-white/20'
-                    : 'bg-gray-100 hover:bg-gray-200 border-gray-300'
-                    }`}
-                >
-                  <Plus size={18} />
-                </motion.button>
-              )}
-
-              {type === 'live' && onOpenSchedule && (
-                <motion.button
-                  whileHover={{ scale: 1.1 }}
-                  whileTap={{ scale: 0.9 }}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    onOpenSchedule();
-                  }}
-                  className={`p-2 rounded-lg border transition-colors ${isDarkMode
-                    ? 'bg-white/10 hover:bg-white/20 border-white/20'
-                    : 'bg-gray-100 hover:bg-gray-200 border-gray-300'
-                    }`}
-                >
-                  <Calendar size={18} />
-                </motion.button>
-              )}
-
-              {type === 'live' && onOpenRecordings && (
-                <motion.button
-                  whileHover={{ scale: 1.1 }}
-                  whileTap={{ scale: 0.9 }}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    onOpenRecordings();
-                  }}
-                  className={`p-2 rounded-lg border transition-colors ${isDarkMode
-                    ? 'bg-white/10 hover:bg-white/20 border-white/20'
-                    : 'bg-gray-100 hover:bg-gray-200 border-gray-300'
-                    }`}
-                >
-                  <ChevronDown size={18} />
-                </motion.button>
-              )}
-            </div>
-
-            <p className={`text-sm mb-2 ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}>
-              {description ?? 'Aucune description disponible.'}
-            </p>
-
-            <div className="flex flex-wrap gap-2">
-              {type === 'live' ? (
-                <span className={`px-2 py-1 rounded text-xs ${isDarkMode ? 'bg-white/10' : 'bg-gray-200'}`}>
-                  {hasArchive ? 'Replay disponible' : 'Replay non disponible'}
-                </span>
-              ) : tags.length > 0 ? (
-                tags.map((tag) => (
-                  <span key={tag} className={`px-2 py-1 rounded text-xs ${isDarkMode ? 'bg-white/10' : 'bg-gray-200'}`}>
-                    {tag}
-                  </span>
-                ))
-              ) : (
-                <span className={`px-2 py-1 rounded text-xs ${isDarkMode ? 'bg-white/10' : 'bg-gray-200'}`}>
-                  Non classé
-                </span>
-              )}
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
     </motion.div>
   );
 }

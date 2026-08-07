@@ -134,4 +134,37 @@ export const migrations: Migration[] = [
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     `,
   },
+  {
+    // Genre-based categorization (Jellyfin content categorized by its TMDB
+    // genre instead of Jellyfin's own library name, and Xtream categories
+    // folded into the same tab when their name matches — see lib/genres.ts)
+    // reuses `tmdb_matches` as its cache, keyed by a distinct
+    // `id|<type>|<tmdbId>` lookup_key namespace (direct id lookups, as
+    // opposed to the existing title/year fuzzy-match lookup_key namespace)
+    // so a Jellyfin item with a known tmdbId never needs fuzzy title
+    // matching just to learn its genres.
+    version: '003_genres',
+    up: `
+      ALTER TABLE tmdb_matches ADD COLUMN genres VARCHAR(255) NULL AFTER release_date;
+    `,
+  },
+  {
+    // Season/episode-level requests — a series request no longer always
+    // means "the whole series". `season_number`/`episode_number` are
+    // NOT NULL DEFAULT 0 ("not applicable to this scope") rather than
+    // nullable: MySQL treats NULL as distinct in a unique key, which would
+    // silently defeat the dedupe this key exists for. The old
+    // (user_id, media_type, tmdb_id)-only key is dropped and replaced —
+    // keeping both would still block "season 2" once "the whole series"
+    // was already requested.
+    version: '004_request_scope',
+    up: `
+      ALTER TABLE media_requests
+        ADD COLUMN scope ENUM('series','season','episode') NOT NULL DEFAULT 'series' AFTER media_type,
+        ADD COLUMN season_number SMALLINT UNSIGNED NOT NULL DEFAULT 0 AFTER year,
+        ADD COLUMN episode_number SMALLINT UNSIGNED NOT NULL DEFAULT 0 AFTER season_number,
+        DROP INDEX uq_request_per_user,
+        ADD UNIQUE KEY uq_request_per_user (user_id, media_type, tmdb_id, season_number, episode_number);
+    `,
+  },
 ];

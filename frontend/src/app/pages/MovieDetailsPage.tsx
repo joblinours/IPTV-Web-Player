@@ -38,7 +38,8 @@ export function MovieDetailsPage() {
         );
     }
 
-    const progress = accountId ? vodProgressMap[`${accountId}:${item.id}`] : undefined;
+    const itemSourceId = item.sourceId ?? accountId;
+    const progress = itemSourceId ? vodProgressMap[`${itemSourceId}:${item.id}`] : undefined;
     const isFavorite = favoritesBySection.films?.has(item.id) ?? false;
     const backdrop = tmdbMatch?.backdropUrl ?? item.poster;
     const description = tmdbMatch?.overview ?? item.description;

@@ -17,18 +17,33 @@ export function createDefaultFavoriteMap(): FavoriteIdMap {
     };
 }
 
-/** Favorites for the active IPTV account/section, with optimistic toggle + rollback on failure. */
+// `${sourceId}:${itemId}` — matches backend/src/utils.ts's favoriteKey().
+// Every favorite is now looked up under this composite key (even in
+// single-source/live mode) so a card component never needs to know whether
+// it's rendering inside a merged view or not.
+function favoriteKey(sourceId: number, itemId: string): string {
+    return `${sourceId}:${itemId}`;
+}
+
+/**
+ * Favorites for the active section, merged across every media_sources row
+ * the user owns for films/series (so a Jellyfin item's favorite state
+ * shows up in the same unified grid as Xtream's), single-source for live
+ * (Jellyfin has no Live TV). Optimistic toggle + rollback on failure.
+ */
 export function useFavorites(token: string | null, accountId: number | null, activeSection: SectionType) {
     const [favoritesBySection, setFavoritesBySection] = useState<FavoriteIdMap>(() => createDefaultFavoriteMap());
+    const merged = activeSection !== 'live';
 
     useEffect(() => {
-        if (!token || !accountId) return;
+        if (!token) return;
+        if (!merged && !accountId) return;
 
         let cancelled = false;
 
         const loadFavorites = async () => {
             try {
-                const result = await fetchFavorites(token, accountId, activeSection);
+                const result = await fetchFavorites(token, accountId, activeSection, { merged });
                 if (cancelled) return;
 
                 setFavoritesBySection((prev) => ({
@@ -50,21 +65,23 @@ export function useFavorites(token: string | null, accountId: number | null, act
         return () => {
             cancelled = true;
         };
-    }, [token, accountId, activeSection]);
+    }, [token, accountId, activeSection, merged]);
 
     const toggleFavorite = useCallback(
         async (item: ContentItem) => {
-            if (!token || !accountId || !item.id) return;
+            if (!token || !item.id) return;
+            const sourceId = item.sourceId ?? accountId;
+            if (!sourceId) return;
 
-            const itemId = item.id;
-            const wasFavorite = favoritesBySection[activeSection]?.has(itemId) ?? false;
+            const key = favoriteKey(sourceId, item.id);
+            const wasFavorite = favoritesBySection[activeSection]?.has(key) ?? false;
 
             setFavoritesBySection((prev) => {
                 const nextSet = new Set(prev[activeSection]);
-                if (nextSet.has(itemId)) {
-                    nextSet.delete(itemId);
+                if (nextSet.has(key)) {
+                    nextSet.delete(key);
                 } else {
-                    nextSet.add(itemId);
+                    nextSet.add(key);
                 }
 
                 return {
@@ -75,17 +92,17 @@ export function useFavorites(token: string | null, accountId: number | null, act
 
             try {
                 if (wasFavorite) {
-                    await removeFavorite(token, { accountId, section: activeSection, itemId });
+                    await removeFavorite(token, { accountId: sourceId, section: activeSection, itemId: item.id });
                 } else {
-                    await addFavorite(token, { accountId, section: activeSection, itemId });
+                    await addFavorite(token, { accountId: sourceId, section: activeSection, itemId: item.id });
                 }
             } catch {
                 setFavoritesBySection((prev) => {
                     const rollbackSet = new Set(prev[activeSection]);
                     if (wasFavorite) {
-                        rollbackSet.add(itemId);
+                        rollbackSet.add(key);
                     } else {
-                        rollbackSet.delete(itemId);
+                        rollbackSet.delete(key);
                     }
 
                     return {

@@ -53,8 +53,20 @@ export async function arrDelete(service: ArrService, path: string): Promise<bool
   return result.ok;
 }
 
+export async function arrPut<T>(
+  service: ArrService,
+  path: string,
+  body: unknown
+): Promise<{ ok: boolean; status: number; body: T | null }> {
+  return arrRequest<T>(service, path, { method: 'PUT', body: JSON.stringify(body) });
+}
+
 export type RadarrLookupResult = Record<string, unknown> & { title?: string; tmdbId?: number };
-export type SonarrLookupResult = Record<string, unknown> & { title?: string; tvdbId?: number };
+export type SonarrLookupResult = Record<string, unknown> & {
+  title?: string;
+  tvdbId?: number;
+  seasons?: Array<{ seasonNumber: number; monitored: boolean }>;
+};
 
 export async function radarrLookupByTmdb(tmdbId: number): Promise<RadarrLookupResult | null> {
   const results = await arrGet<RadarrLookupResult[]>('radarr', `/api/v3/movie/lookup?term=tmdb:${tmdbId}`);
@@ -74,6 +86,41 @@ export async function radarrFindExistingByTmdb(tmdbId: number): Promise<{ id: nu
 export async function sonarrFindExistingByTvdb(tvdbId: number): Promise<{ id: number } | null> {
   const results = await arrGet<Array<{ id: number; tvdbId: number }>>('sonarr', '/api/v3/series');
   return results?.find((series) => series.tvdbId === tvdbId) ?? null;
+}
+
+export type SonarrEpisode = {
+  id: number;
+  seriesId: number;
+  seasonNumber: number;
+  episodeNumber: number;
+  title?: string;
+  monitored: boolean;
+  hasFile: boolean;
+};
+
+/**
+ * Season/episode-scoped requests (see routes/requests.ts, `scope` field) —
+ * the shapes below match Sonarr v3's documented API as of this writing.
+ * NOT verified against a live instance in this environment: if the
+ * deployed Sonarr version's `/api/v3/docs` Swagger disagrees on the exact
+ * route/body shape, this is the first place to check.
+ */
+export async function sonarrGetEpisodes(seriesId: number): Promise<SonarrEpisode[]> {
+  const results = await arrGet<SonarrEpisode[]>('sonarr', `/api/v3/episode?seriesId=${seriesId}`);
+  return results ?? [];
+}
+
+export async function sonarrMonitorEpisode(episodeIds: number[], monitored: boolean): Promise<boolean> {
+  const result = await arrPut('sonarr', '/api/v3/episode/monitor', { episodeIds, monitored });
+  return result.ok;
+}
+
+export async function sonarrTriggerCommand(
+  name: 'EpisodeSearch' | 'SeasonSearch' | 'SeriesSearch',
+  params: Record<string, unknown>
+): Promise<boolean> {
+  const result = await arrPost('sonarr', '/api/v3/command', { name, ...params });
+  return result.ok;
 }
 
 export async function resolveTvdbId(tmdbId: number): Promise<number | null> {

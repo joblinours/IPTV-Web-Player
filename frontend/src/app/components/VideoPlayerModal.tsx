@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import Hls from 'hls.js';
-import { Maximize, Minimize, Pause, Play, RotateCcw, RotateCw, SkipForward, Volume2, VolumeX, X } from 'lucide-react';
+import { Languages, Maximize, Minimize, Pause, Play, RotateCcw, RotateCw, SkipForward, Volume2, VolumeX, X } from 'lucide-react';
 
 const AUTOPLAY_COUNTDOWN_START = 5;
 
@@ -60,6 +60,8 @@ interface VideoPlayerModalProps {
     realDuration?: number;
     /** Called once when the player switches to the ffmpeg transcode fallback source */
     onTranscodeFallback?: () => void;
+    /** Called when every candidate source has failed — playback is a dead end, surface this instead of leaving the player silently stuck */
+    onExhausted?: () => void;
     /** Enable/disable keyboard shortcuts for this player instance */
     keyboardEnabled?: boolean;
     /** Live channels should not expose seek/progress controls */
@@ -81,6 +83,7 @@ export function VideoPlayerModal({
     onPreviousEpisode,
     realDuration,
     onTranscodeFallback,
+    onExhausted,
     keyboardEnabled = true,
     isLive = false,
 }: VideoPlayerModalProps) {
@@ -107,6 +110,8 @@ export function VideoPlayerModal({
     realDurationRef.current = realDuration;
     const onTranscodeFallbackRef = useRef(onTranscodeFallback);
     onTranscodeFallbackRef.current = onTranscodeFallback;
+    const onExhaustedRef = useRef(onExhausted);
+    onExhaustedRef.current = onExhausted;
 
     const activeSourceUrlRef = useRef<string | null>(null);
     // Seconds already consumed by a backend -ss seek (ffmpeg seekSeconds param).
@@ -121,6 +126,10 @@ export function VideoPlayerModal({
     const transcodeSeekUnlockTimerRef = useRef<number | null>(null);
     const loadSourceRef = useRef<((url: string) => void) | null>(null);
     const transcodeRecoveryAttemptsRef = useRef(0);
+    // Exposes the hls.js instance to the audio-track picker's click handler
+    // (the instance itself lives in a local `let hls` inside the main
+    // effect below, out of reach from render — this ref is the bridge).
+    const hlsRef = useRef<Hls | null>(null);
 
     // ── Custom player UI state ───────────────────────────────────────────────
     const [isPlaying, setIsPlaying] = useState(false);
@@ -138,6 +147,16 @@ export function VideoPlayerModal({
     const [isDragging, setIsDragging] = useState(false);
     const seekBarRef = useRef<HTMLDivElement>(null);
     const dragSeekRatioRef = useRef<number | null>(null);
+
+    // ── Audio track selection (hls.js multi-track HLS only) ─────────────────
+    // Relies entirely on hls.js's own audioTracks API rather than any custom
+    // per-source detection: it "just works" whenever the underlying stream
+    // (IPTV or the ffmpeg transcode) declares more than one audio rendition,
+    // and stays empty — hiding the picker — otherwise, matching the "when
+    // possible" scope of this feature.
+    const [audioTracks, setAudioTracks] = useState<Array<{ id: number; label: string }>>([]);
+    const [activeAudioTrackId, setActiveAudioTrackId] = useState(-1);
+    const [showAudioMenu, setShowAudioMenu] = useState(false);
 
     // ── Controls auto-hide ───────────────────────────────────────────────────
     const resetControlsTimeout = useCallback(() => {
@@ -247,6 +266,12 @@ export function VideoPlayerModal({
         let watchdogTimer: number | null = null;
         let switchedByWatchdog = false;
         let didSeek = false;
+        // Guards against the watchdog and the hls.js ERROR handler both
+        // firing for the same underlying failure and racing to advance
+        // sourceIndex twice (each would otherwise call tryNextSource()
+        // independently for one bad source, silently skipping the next
+        // candidate). Reset every time a new source actually starts loading.
+        let advancing = false;
 
         isTranscodeModeRef.current = false;
         activeSourceUrlRef.current = null;
@@ -284,10 +309,16 @@ export function VideoPlayerModal({
         };
 
         const tryNextSource = () => {
+            if (advancing) return;
+            advancing = true;
             clearWatchdog();
             sourceIndex += 1;
             if (sourceIndex < allSources.length) {
                 loadSource(allSources[sourceIndex]);
+            } else {
+                // Every candidate failed — surface this instead of leaving
+                // the player silently stuck on a dead video element.
+                onExhaustedRef.current?.();
             }
         };
 
@@ -346,8 +377,12 @@ export function VideoPlayerModal({
 
         const loadSource = (url: string) => {
             if (hls) { hls.destroy(); hls = null; }
+            hlsRef.current = null;
+            setAudioTracks([]);
+            setActiveAudioTrackId(-1);
             clearWatchdog();
             didSeek = false;
+            advancing = false;
             activeSourceUrlRef.current = url;
             videoElement.pause();
             videoElement.removeAttribute('src');
@@ -374,11 +409,23 @@ export function VideoPlayerModal({
                 hlsRecoverAttempted = false;
                 hls = new Hls({
                     enableWorker: true,
-                    lowLatencyMode: true,
+                    // Only meaningful (and only worth its overhead) for live
+                    // streams — VOD/transcode playback has no "live edge" to
+                    // chase, so this was pure unnecessary cost there.
+                    lowLatencyMode: isLive,
                     backBufferLength: 30,
                 });
+                hlsRef.current = hls;
                 hls.loadSource(url);
                 hls.attachMedia(videoElement);
+                hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, () => {
+                    const tracks = hls?.audioTracks ?? [];
+                    setAudioTracks(tracks.map((track, index) => ({ id: index, label: track.name || track.lang || `Piste ${index + 1}` })));
+                    setActiveAudioTrackId(hls?.audioTrack ?? -1);
+                });
+                hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, (_event: string, data: { id: number }) => {
+                    setActiveAudioTrackId(data.id);
+                });
                 hls.on(Hls.Events.ERROR, (_: string, data: { fatal: boolean; type?: string }) => {
                     if (Date.now() < suppressErrorsUntilRef.current) {
                         return;
@@ -549,6 +596,7 @@ export function VideoPlayerModal({
             videoElement.removeAttribute('src');
             videoElement.load();
             if (hls) hls.destroy();
+            hlsRef.current = null;
         };
     }, [open, streamUrl, allSources, isLive]);
 
@@ -833,6 +881,47 @@ export function VideoPlayerModal({
                                 )}
 
                                 <div className="flex-1" />
+
+                                {/* Audio track picker — only ever rendered when the current
+                                    stream (IPTV or the ffmpeg transcode) actually declares more
+                                    than one audio rendition; hls.js populates audioTracks for us,
+                                    no per-source detection needed. */}
+                                {audioTracks.length > 1 && (
+                                    <div className="relative shrink-0">
+                                        <button
+                                            onClick={(e: React.MouseEvent) => {
+                                                e.stopPropagation();
+                                                setShowAudioMenu((prev) => !prev);
+                                            }}
+                                            className="text-white hover:text-red-400 transition-colors"
+                                            aria-label="Choisir la langue audio"
+                                        >
+                                            <Languages size={18} />
+                                        </button>
+                                        {showAudioMenu && (
+                                            <div
+                                                className="absolute bottom-full right-0 mb-2 min-w-[160px] rounded-lg bg-black/90 border border-white/10 backdrop-blur-sm overflow-hidden"
+                                                onClick={(e: React.MouseEvent) => e.stopPropagation()}
+                                            >
+                                                {audioTracks.map((track) => (
+                                                    <button
+                                                        key={track.id}
+                                                        onClick={() => {
+                                                            if (hlsRef.current) hlsRef.current.audioTrack = track.id;
+                                                            setActiveAudioTrackId(track.id);
+                                                            setShowAudioMenu(false);
+                                                        }}
+                                                        className={`block w-full text-left px-3 py-2 text-sm transition-colors ${
+                                                            track.id === activeAudioTrackId ? 'text-red-400 bg-white/10' : 'text-white hover:bg-white/10'
+                                                        }`}
+                                                    >
+                                                        {track.label}
+                                                    </button>
+                                                ))}
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
 
                                 {/* Fullscreen */}
                                 <button

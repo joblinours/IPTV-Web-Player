@@ -3,6 +3,11 @@ import type { CategoryItem, ContentItem, ContentType, MediaSourceRow, PlaybackTa
 import { decryptSecret } from '../crypto.js';
 import { env } from '../config.js';
 import { cacheKey, getCache, getOrSet, setCache } from '../redis.js';
+import { resolveTmdbGenresById } from '../tmdb.js';
+import { genreNameForSlug } from '../lib/genres.js';
+
+const GENRE_CATEGORY_PREFIX = 'genre:';
+const UNCATEGORIZED_ID = 'uncategorized';
 
 type JellyfinItem = {
   Id: string;
@@ -57,7 +62,7 @@ function itemTypeFor(type: ContentType): 'Movie' | 'Series' | null {
   return null; // Jellyfin has no tuner in this stack; Live TV is Xtream-only.
 }
 
-function mapItem(src: MediaSourceRow, libraryId: string, item: JellyfinItem): ContentItem {
+function mapItem(src: MediaSourceRow, libraryId: string, item: JellyfinItem, type: ContentType): ContentItem {
   const durationSeconds = item.RunTimeTicks ? Math.round(item.RunTimeTicks / 10_000_000) : null;
   const duration = durationSeconds
     ? new Date(durationSeconds * 1000).toISOString().substring(11, 19)
@@ -81,7 +86,12 @@ function mapItem(src: MediaSourceRow, libraryId: string, item: JellyfinItem): Co
     durationSeconds,
     containerExtension: item.MediaSources?.[0]?.Container ?? null,
     streamId: null,
-    seriesId: null,
+    // Every item in a `type: 'series'` listing IS a series (Jellyfin has no
+    // tuner, so this provider's series listing is Series items only) — the
+    // GUID doubles as seriesId so series playback/details resolve the same
+    // way an Xtream series_id does. Previously always null here, which
+    // silently broke "open series details" for every Jellyfin series.
+    seriesId: type === 'series' ? item.Id : null,
     source: 'jellyfin',
     sourceId: src.id,
     itemId: item.Id,
@@ -96,6 +106,25 @@ async function listLibraries(src: MediaSourceRow): Promise<JellyfinView[]> {
     const data = await jellyfinFetch<{ Items: JellyfinView[] }>(`/Users/${userId}/Views`);
     return data.Items ?? [];
   });
+}
+
+// Re-categorizes items by their TMDB genre instead of the raw Jellyfin
+// library they came from — one genre per item (the first TMDB returns),
+// consistent with the rest of the app treating category as single-valued.
+// Items without a known tmdbId, or whose id doesn't resolve to any
+// canonical genre, keep their library-derived categoryId (mapItem's
+// default) as a safe fallback rather than disappearing from every tab.
+async function applyGenreCategories(items: ContentItem[], type: ContentType): Promise<void> {
+  const tmdbType = type === 'vod' ? 'movie' : 'tv';
+  await Promise.allSettled(
+    items.map(async (item) => {
+      if (!item.tmdbId) return;
+      const { genres } = await resolveTmdbGenresById(item.tmdbId, tmdbType);
+      if (genres.length > 0) {
+        item.categoryId = `${GENRE_CATEGORY_PREFIX}${genres[0].slug}`;
+      }
+    })
+  );
 }
 
 async function listAllItems(src: MediaSourceRow, type: ContentType): Promise<ContentItem[]> {
@@ -120,11 +149,12 @@ async function listAllItems(src: MediaSourceRow, type: ContentType): Promise<Con
           `&EnableImageTypes=Primary,Backdrop&ImageTypeLimit=1` +
           `&Fields=Overview,Genres,ProductionYear,ProviderIds,RunTimeTicks,CommunityRating,MediaSources`
         );
-        items.push(...page.Items.map((item) => mapItem(src, library.Id, item)));
+        items.push(...page.Items.map((item) => mapItem(src, library.Id, item, type)));
         startIndex += limit;
         if (startIndex >= page.TotalRecordCount || page.Items.length === 0) break;
       }
     }
+    await applyGenreCategories(items, type);
     return items;
   });
 }
@@ -136,20 +166,41 @@ export const jellyfinProvider: ContentProvider = {
     const includeType = itemTypeFor(type);
     if (!includeType) return [{ id: 'favorites', name: 'Favoris' }, { id: 'all', name: 'Tous' }];
 
-    const libraries = await listLibraries(src);
-    const wantedCollection = type === 'vod' ? 'movies' : 'tvshows';
-    const matching = libraries.filter((lib) => lib.CollectionType === wantedCollection);
+    // Categories are now the TMDB genres actually present among this
+    // user's Jellyfin items (see applyGenreCategories), not Jellyfin's own
+    // library names — this is what lets a merged Xtream+Jellyfin view fold
+    // matching genres into the same tab (see routes/catalog.ts merged mode).
+    const items = await listAllItems(src, type);
+    const genreNames = new Map<string, string>();
+    let hasUncategorized = false;
+    for (const item of items) {
+      if (item.categoryId?.startsWith(GENRE_CATEGORY_PREFIX)) {
+        const slug = item.categoryId.slice(GENRE_CATEGORY_PREFIX.length);
+        genreNames.set(item.categoryId, genreNameForSlug(slug) ?? slug);
+      } else {
+        hasUncategorized = true;
+      }
+    }
 
-    return [
+    const categories: CategoryItem[] = [
       { id: 'favorites', name: 'Favoris' },
       { id: 'all', name: 'Tous' },
-      ...matching.map((lib) => ({ id: lib.Id, name: lib.Name })),
+      ...[...genreNames.entries()]
+        .map(([id, name]) => ({ id, name }))
+        .sort((a, b) => a.name.localeCompare(b.name)),
     ];
+    if (hasUncategorized) {
+      categories.push({ id: UNCATEGORIZED_ID, name: 'Autre' });
+    }
+    return categories;
   },
 
   async listContent(src, type, categoryId): Promise<ContentItem[]> {
     const items = await listAllItems(src, type);
     if (categoryId === 'all' || categoryId === 'favorites') return items;
+    if (categoryId === UNCATEGORIZED_ID) {
+      return items.filter((item) => !item.categoryId?.startsWith(GENRE_CATEGORY_PREFIX));
+    }
     return items.filter((item) => item.categoryId === categoryId);
   },
 
@@ -207,28 +258,19 @@ export const jellyfinProvider: ContentProvider = {
   },
 
   async buildPlayback(src, { itemId }): Promise<PlaybackTarget[]> {
+    // Only a single candidate: the raw file. This provider never talks to
+    // Jellyfin's own PlaybackInfo/TranscodingUrl (it used to, but every
+    // caller in routes/stream.ts destructures `const [target] = ...` and
+    // only ever consumes this first element — a second candidate here was
+    // dead code, never reachable). The actual "make the audio browser-safe"
+    // fallback is StreamHub's own ffmpeg transcode route
+    // (GET /api/iptv/transcode), which the frontend already places ahead of
+    // this raw candidate for Jellyfin items specifically, since raw
+    // downloads of ripped media very often carry a non-web audio codec
+    // (DTS/TrueHD/EAC3) that this direct URL does nothing to fix.
     const apiKey = decryptSecret(src.secret_enc);
-    const targets: PlaybackTarget[] = [
+    return [
       { url: `${env.jellyfinUrl}/Items/${itemId}/Download?api_key=${encodeURIComponent(apiKey)}`, hint: 'direct' },
     ];
-
-    try {
-      const userId = await resolveUserId();
-      const playbackInfo = await jellyfinFetch<{ MediaSources?: Array<{ TranscodingUrl?: string }> }>(
-        `/Items/${itemId}/PlaybackInfo?userId=${userId}`,
-        { method: 'POST' }
-      );
-      const transcodingUrl = playbackInfo.MediaSources?.[0]?.TranscodingUrl;
-      if (transcodingUrl) {
-        targets.push({
-          url: `${env.jellyfinUrl}${transcodingUrl}&api_key=${encodeURIComponent(apiKey)}`,
-          hint: 'hls',
-        });
-      }
-    } catch {
-      // Direct download candidate above is still a valid fallback.
-    }
-
-    return targets;
   },
 };

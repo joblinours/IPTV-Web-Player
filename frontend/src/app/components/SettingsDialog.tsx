@@ -84,14 +84,18 @@ export function SettingsDialog({
                                 <Globe size={20} className="text-blue-400" />
                             </div>
                             <div>
-                                <h3 className="font-semibold">Compte IPTV actif</h3>
-                                <p className="text-sm text-gray-400">Sélectionnez le compte utilisé pour le catalogue</p>
+                                <h3 className="font-semibold">Compte IPTV actif (TV en direct)</h3>
+                                <p className="text-sm text-gray-400">Films et séries affichent toujours tout vos comptes réunis — ce choix ne concerne que la TV en direct.</p>
                             </div>
                         </div>
 
                         <div className="space-y-2">
-                            {accounts.length === 0 && <p className="text-sm text-gray-400">Aucun compte IPTV configuré.</p>}
-                            {accounts.map((account) => (
+                            {/* Jellyfin has no Live TV of its own (no tuner) — showing it here would let
+                                someone "select" a source that can only ever show an empty live grid. */}
+                            {accounts.filter((account) => account.kind !== 'jellyfin').length === 0 && (
+                                <p className="text-sm text-gray-400">Aucun compte IPTV configuré.</p>
+                            )}
+                            {accounts.filter((account) => account.kind !== 'jellyfin').map((account) => (
                                 <button
                                     key={account.id}
                                     onClick={() => onSwitchAccount?.(account.id)}

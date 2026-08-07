@@ -43,7 +43,8 @@ export interface ContentItem {
   durationSeconds?: number | null;
   containerExtension?: string | null;
   streamId: number | null;
-  seriesId: number | null;
+  // Xtream series carry a numeric id; Jellyfin series use a GUID string.
+  seriesId: number | string | null;
   // Multi-source (Xtream + Jellyfin) fields — additive, always set by the
   // backend but optional here so older cached shapes still type-check.
   source?: 'xtream' | 'jellyfin';
@@ -197,15 +198,30 @@ export async function addIptvAccount(token: string, payload: AddIptvAccountPaylo
   }, token);
 }
 
-export async function fetchCategories(token: string, accountId: number, section: SectionType) {
+// `accountId: null` + `merged: true` fans out across every source the user
+// owns (see backend/src/routes/catalog.ts's `mode=merged`) — used for
+// films/series so Xtream and Jellyfin content share one browsing surface
+// instead of requiring an account switch. Live TV has no Jellyfin
+// equivalent and always passes a real accountId with merged left false.
+export async function fetchCategories(token: string, accountId: number | null, section: SectionType, opts: { merged?: boolean } = {}) {
   const type = sectionToBackendType(section);
-  const query = new URLSearchParams({ accountId: String(accountId), type });
+  const query = new URLSearchParams({ type });
+  if (opts.merged) {
+    query.set('mode', 'merged');
+  } else if (accountId !== null) {
+    query.set('accountId', String(accountId));
+  }
   return request<{ items: CategoryItem[] }>(`/api/iptv/categories?${query.toString()}`, { method: 'GET' }, token);
 }
 
-export async function fetchFavorites(token: string, accountId: number, section: SectionType): Promise<FavoritesResponse> {
+export async function fetchFavorites(token: string, accountId: number | null, section: SectionType, opts: { merged?: boolean } = {}): Promise<FavoritesResponse> {
   const type = sectionToBackendType(section);
-  const query = new URLSearchParams({ accountId: String(accountId), type });
+  const query = new URLSearchParams({ type });
+  if (opts.merged) {
+    query.set('mode', 'merged');
+  } else if (accountId !== null) {
+    query.set('accountId', String(accountId));
+  }
   return request<FavoritesResponse>(`/api/favorites?${query.toString()}`, { method: 'GET' }, token);
 }
 
@@ -236,7 +252,8 @@ export async function removeFavorite(token: string, params: { accountId: number;
 export async function fetchContentPage(
   token: string,
   params: {
-    accountId: number;
+    accountId: number | null;
+    merged?: boolean;
     section: SectionType;
     categoryId: string;
     searchQuery: string;
@@ -246,13 +263,17 @@ export async function fetchContentPage(
 ): Promise<ContentResponse> {
   const type = sectionToBackendType(params.section);
   const query = new URLSearchParams({
-    accountId: String(params.accountId),
     type,
     categoryId: params.categoryId,
     search: params.searchQuery,
     offset: String(params.offset),
     limit: String(params.limit ?? 50),
   });
+  if (params.merged) {
+    query.set('mode', 'merged');
+  } else if (params.accountId !== null) {
+    query.set('accountId', String(params.accountId));
+  }
 
   return request<ContentResponse>(`/api/iptv/content?${query.toString()}`, { method: 'GET' }, token);
 }
@@ -286,7 +307,7 @@ export async function fetchStreamUrl(
   return request<{ url: string }>(`/api/iptv/stream-url?${query.toString()}`, { method: 'GET' }, token);
 }
 
-export async function fetchSeriesInfo(token: string, accountId: number, seriesId: number) {
+export async function fetchSeriesInfo(token: string, accountId: number, seriesId: number | string) {
   const query = new URLSearchParams({
     accountId: String(accountId),
     seriesId: String(seriesId),
@@ -420,6 +441,19 @@ export async function fetchProgress(
   return request<{ items: ProgressEntry[] }>(`/api/progress?${query.toString()}`, { method: 'GET' }, token);
 }
 
+// Merged counterpart of fetchProgress: `itemKeys` are `${sourceId}:${itemId}`
+// composite strings (see backend/src/routes/progress.ts's `mode=merged`) —
+// needed once a single listing can contain items from more than one
+// source, where a bare itemId is no longer guaranteed unique.
+export async function fetchProgressMerged(
+  token: string,
+  type: 'vod' | 'series_episode',
+  itemKeys: string[]
+): Promise<{ items: Array<ProgressEntry & { sourceId: number }> }> {
+  const query = new URLSearchParams({ mode: 'merged', type, itemKeys: itemKeys.join(',') });
+  return request<{ items: Array<ProgressEntry & { sourceId: number }> }>(`/api/progress?${query.toString()}`, { method: 'GET' }, token);
+}
+
 export async function fetchSeriesProgress(
   token: string,
   accountId: number,
@@ -510,6 +544,32 @@ export async function fetchTmdbMatch(
   return request<TmdbMatch>(`/api/tmdb/match?${query.toString()}`, { method: 'GET' }, token);
 }
 
+export interface TmdbMatchBatchItem {
+  title: string;
+  type: 'movie' | 'series';
+  year: string | null;
+  match: TmdbMatch;
+  pending: boolean;
+}
+
+/**
+ * Batch, cache-only counterpart of fetchTmdbMatch — one call per rendered
+ * row/page of cards instead of one per card. Never blocks on a live TMDB
+ * call: entries not already cached come back `{ match: { enabled: false },
+ * pending: true }` while the backend resolves them in the background (see
+ * POST /api/tmdb/match-batch) for a future call to pick up.
+ */
+export async function fetchTmdbMatchBatch(
+  token: string,
+  items: Array<{ title: string; type: 'movie' | 'series'; year?: string }>
+): Promise<{ items: TmdbMatchBatchItem[] }> {
+  return request<{ items: TmdbMatchBatchItem[] }>(
+    '/api/tmdb/match-batch',
+    { method: 'POST', body: JSON.stringify({ items }) },
+    token
+  );
+}
+
 // ── Discover / Requests (Radarr + Sonarr) ───────────────────────────────────
 
 export interface TmdbSearchResultItem {
@@ -542,10 +602,15 @@ export async function searchTmdb(
 export type MediaRequestStatus =
   | 'pending' | 'added' | 'downloading' | 'imported' | 'available' | 'failed' | 'rejected';
 
+export type MediaRequestScope = 'series' | 'season' | 'episode';
+
 export interface MediaRequest {
   id: number;
   tmdbId: number;
   mediaType: 'movie' | 'tv';
+  scope: MediaRequestScope;
+  seasonNumber: number | null;
+  episodeNumber: number | null;
   title: string;
   year: number | null;
   posterUrl: string | null;
@@ -557,7 +622,18 @@ export interface MediaRequest {
 
 export async function createRequest(
   token: string,
-  payload: { tmdbId: number; mediaType: 'movie' | 'tv'; title?: string; year?: number; posterPath?: string }
+  payload: {
+    tmdbId: number;
+    mediaType: 'movie' | 'tv';
+    title?: string;
+    year?: number;
+    posterPath?: string;
+    // Series-only — see backend/src/routes/requests.ts. Omit (or 'series')
+    // to request the whole series, matching the previous behavior.
+    scope?: MediaRequestScope;
+    seasonNumber?: number;
+    episodeNumber?: number;
+  }
 ) {
   return request<{ id: number; status: string; alreadyRequested: boolean }>(
     '/api/requests',

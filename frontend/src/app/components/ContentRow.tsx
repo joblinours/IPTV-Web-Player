@@ -1,6 +1,8 @@
 import { useRef, useState, useEffect } from 'react';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { ContentCard } from './ContentCard';
+import { useAppContext } from '../AppContext';
+import { useTmdbMatchBatch } from '../hooks/useTmdbMatchBatch';
 import type { ContentItem, ProgressEntry, SeriesProgressSummary, SectionType } from '../lib/api';
 
 interface ContentRowProps {
@@ -41,6 +43,12 @@ export function ContentRow({
     seriesProgressMap = {},
     accountId,
 }: ContentRowProps) {
+    const { token } = useAppContext();
+    // TMDB enrichment applies to every row now (films AND series), not just
+    // the Hero — a plain, cache-only batch call per row, falling back to
+    // Xtream/Jellyfin's own metadata wherever nothing's cached yet.
+    const { getMatch } = useTmdbMatchBatch(token, section === 'live' ? [] : items, section === 'series' ? 'series' : 'movie');
+
     const scrollRef = useRef<HTMLDivElement>(null);
     const [canScrollLeft, setCanScrollLeft] = useState(false);
     const [canScrollRight, setCanScrollRight] = useState(false);
@@ -90,18 +98,26 @@ export function ContentRow({
                     className="flex gap-4 overflow-x-auto scroll-smooth px-4 sm:px-6 lg:px-8 pb-2"
                     style={{ scrollbarWidth: 'none' }}
                 >
-                    {items.map((item, index) => (
+                    {items.map((item, index) => {
+                        // Falls back to the ambient accountId only for items
+                        // that somehow lack their own sourceId (shouldn't
+                        // happen for real API responses, both providers set
+                        // it) — keeps favorite/progress lookups correct once
+                        // a row can mix items from more than one source.
+                        const sid = item.sourceId ?? accountId;
+                        const tmdb = section === 'live' ? null : getMatch(item.title, item.year);
+                        return (
                         <div key={`${item.source ?? 'xt'}-${item.id}-${index}`} className="flex-none">
                             <ContentCard
                                 title={item.title}
                                 type={section}
                                 index={index}
                                 isDarkMode={isDarkMode}
-                                poster={item.poster}
-                                description={item.description}
+                                poster={item.poster ?? tmdb?.posterUrl ?? null}
+                                description={item.description ?? tmdb?.overview ?? null}
                                 genre={item.genre}
                                 year={item.year}
-                                rating={item.rating}
+                                rating={item.rating ?? (tmdb?.rating != null ? tmdb.rating.toFixed(1) : null)}
                                 hasArchive={item.hasArchive}
                                 seasonsCount={item.seasonsCount}
                                 episodesCount={item.episodesCount}
@@ -109,17 +125,17 @@ export function ContentRow({
                                 onDetails={onOpenDetails ? () => onOpenDetails(item) : undefined}
                                 onOpenSchedule={onOpenSchedule ? () => onOpenSchedule(item) : undefined}
                                 onOpenRecordings={onOpenRecordings ? () => onOpenRecordings(item) : undefined}
-                                isFavorite={favoriteIds?.has(item.id) ?? false}
+                                isFavorite={(sid ? favoriteIds?.has(`${sid}:${item.id}`) : false) ?? false}
                                 onToggleFavorite={onToggleFavorite ? () => onToggleFavorite(item) : undefined}
                                 progress={
-                                    section === 'films' && accountId
+                                    section === 'films' && sid
                                         ? (() => {
-                                              const e = vodProgressMap[`${accountId}:${item.id}`];
+                                              const e = vodProgressMap[`${sid}:${item.id}`];
                                               return e ? { currentTime: e.currentTime, totalDuration: e.totalDuration, isWatched: e.isWatched } : undefined;
                                           })()
-                                        : section === 'series' && accountId && item.seriesId
+                                        : section === 'series' && sid && item.seriesId
                                         ? (() => {
-                                              const s = seriesProgressMap[`${accountId}:${item.seriesId}`];
+                                              const s = seriesProgressMap[`${sid}:${item.seriesId}`];
                                               if (!s?.lastEpisode) return undefined;
                                               const { lastEpisode } = s;
                                               return {
@@ -132,7 +148,8 @@ export function ContentRow({
                                 }
                             />
                         </div>
-                    ))}
+                        );
+                    })}
                 </div>
 
                 {canScrollRight && (

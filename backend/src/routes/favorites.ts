@@ -1,17 +1,35 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { queryOne, queryAll, execute, nowEpoch } from '../db.js';
+import { favoriteKey } from '../utils.js';
 
 export function registerFavoritesRoutes(app: FastifyInstance) {
   app.get('/api/favorites', { preHandler: [app.authenticate] }, async (request: any, reply) => {
     const querySchema = z.object({
-      accountId: z.coerce.number().int().positive(),
+      accountId: z.coerce.number().int().positive().optional(),
+      mode: z.enum(['single', 'merged']).optional().default('single'),
       type: z.enum(['live', 'vod', 'series']),
     });
 
     const parsed = querySchema.safeParse(request.query);
     if (!parsed.success) {
       return reply.code(400).send({ message: 'Invalid query' });
+    }
+
+    // Merged mode: favorites across every media_sources row the user owns,
+    // returned as `${sourceId}:${itemId}` composite keys (see utils.ts's
+    // favoriteKey) so the frontend can match them against items pulled
+    // from more than one source in the same unified listing.
+    if (parsed.data.mode === 'merged') {
+      const rows = await queryAll<{ source_id: number; item_id: string }>(
+        'SELECT source_id, item_id FROM favorites WHERE user_id = ? AND type = ? ORDER BY id DESC',
+        [request.user.userId, parsed.data.type]
+      );
+      return { items: rows.map((row) => favoriteKey(row.source_id, row.item_id)) };
+    }
+
+    if (!parsed.data.accountId) {
+      return reply.code(400).send({ message: 'accountId is required outside merged mode' });
     }
 
     const source = await queryOne<{ id: number }>(
@@ -28,7 +46,7 @@ export function registerFavoritesRoutes(app: FastifyInstance) {
       [request.user.userId, parsed.data.accountId, parsed.data.type]
     );
 
-    return { items: rows.map((row) => row.item_id) };
+    return { items: rows.map((row) => favoriteKey(parsed.data.accountId!, row.item_id)) };
   });
 
   app.post('/api/favorites', { preHandler: [app.authenticate] }, async (request: any, reply) => {

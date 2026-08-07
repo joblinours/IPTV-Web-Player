@@ -2,6 +2,8 @@ import { useEffect, useRef } from 'react';
 import { motion } from 'motion/react';
 import { Loader2 } from 'lucide-react';
 import { ContentCard } from './ContentCard';
+import { useAppContext } from '../AppContext';
+import { useTmdbMatchBatch } from '../hooks/useTmdbMatchBatch';
 import type { ContentItem, ProgressEntry, SeriesProgressSummary, SectionType } from '../lib/api';
 
 interface PaginatedContentGridProps {
@@ -41,6 +43,9 @@ export function PaginatedContentGrid({
     seriesProgressMap = {},
     accountId,
 }: PaginatedContentGridProps) {
+    const { token } = useAppContext();
+    const { getMatch } = useTmdbMatchBatch(token, section === 'live' ? [] : items, section === 'series' ? 'series' : 'movie');
+
     const sentinelRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
@@ -64,9 +69,15 @@ export function PaginatedContentGrid({
     return (
         <div className="space-y-6">
             <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 gap-6">
-                {items.map((item, index) => (
+                {items.map((item, index) => {
+                    // Falls back to the ambient accountId only for items
+                    // that somehow lack their own sourceId — both providers
+                    // set it on every real API response.
+                    const sid = item.sourceId ?? accountId;
+                    const tmdb = section === 'live' ? null : getMatch(item.title, item.year);
+                    return (
                     <motion.div
-                        key={`${item.id}-${index}`}
+                        key={`${item.source ?? 'xt'}-${item.id}-${index}`}
                         initial={{ opacity: 0, y: 12 }}
                         animate={{ opacity: 1, y: 0 }}
                         transition={{ duration: 0.25 }}
@@ -76,11 +87,11 @@ export function PaginatedContentGrid({
                             type={section}
                             index={index}
                             isDarkMode={isDarkMode}
-                            poster={item.poster}
-                            description={item.description}
+                            poster={item.poster ?? tmdb?.posterUrl ?? null}
+                            description={item.description ?? tmdb?.overview ?? null}
                             genre={item.genre}
                             year={item.year}
-                            rating={item.rating}
+                            rating={item.rating ?? (tmdb?.rating != null ? tmdb.rating.toFixed(1) : null)}
                             hasArchive={item.hasArchive}
                             seasonsCount={item.seasonsCount}
                             episodesCount={item.episodesCount}
@@ -88,17 +99,17 @@ export function PaginatedContentGrid({
                             onDetails={onOpenDetails ? () => onOpenDetails(item) : undefined}
                             onOpenSchedule={onOpenSchedule ? () => onOpenSchedule(item) : undefined}
                             onOpenRecordings={onOpenRecordings ? () => onOpenRecordings(item) : undefined}
-                            isFavorite={favoriteIds?.has(item.id) ?? false}
+                            isFavorite={(sid ? favoriteIds?.has(`${sid}:${item.id}`) : false) ?? false}
                             onToggleFavorite={onToggleFavorite ? () => onToggleFavorite(item) : undefined}
                             progress={
-                                section === 'films' && accountId
+                                section === 'films' && sid
                                     ? (() => {
-                                          const e = vodProgressMap[`${accountId}:${item.id}`];
+                                          const e = vodProgressMap[`${sid}:${item.id}`];
                                           return e ? { currentTime: e.currentTime, totalDuration: e.totalDuration, isWatched: e.isWatched } : undefined;
                                       })()
-                                    : section === 'series' && accountId && item.seriesId
+                                    : section === 'series' && sid && item.seriesId
                                     ? (() => {
-                                          const s = seriesProgressMap[`${accountId}:${item.seriesId}`];
+                                          const s = seriesProgressMap[`${sid}:${item.seriesId}`];
                                           if (!s?.lastEpisode) return undefined;
                                           const { lastEpisode } = s;
                                           return {
@@ -111,7 +122,8 @@ export function PaginatedContentGrid({
                             }
                         />
                     </motion.div>
-                ))}
+                    );
+                })}
             </div>
 
             {items.length === 0 && !isLoading && isFavoritesView && (

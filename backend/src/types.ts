@@ -105,7 +105,8 @@ export type ContentItem = {
   durationSeconds: number | null;
   containerExtension: string | null;
   streamId: number | null;
-  seriesId: number | null;
+  // Xtream series carry a numeric id; Jellyfin series use a GUID string.
+  seriesId: number | string | null;
   // Added for the multi-source (Xtream + Jellyfin) abstraction.
   source: SourceKind;
   sourceId: number;

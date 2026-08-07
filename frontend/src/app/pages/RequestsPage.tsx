@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react';
-import { Search, Plus, Check, Clock, Download, AlertTriangle, Trash2 } from 'lucide-react';
+import { Search, Plus, Check, Clock, Download, AlertTriangle, Trash2, Tv } from 'lucide-react';
 import { useAppContext } from '../AppContext';
 import {
     searchTmdb, createRequest, fetchRequests, deleteRequest,
-    type TmdbSearchResultItem, type MediaRequest,
+    type TmdbSearchResultItem, type MediaRequest, type MediaRequestScope,
 } from '../lib/api';
 
 const STATUS_LABEL: Record<MediaRequest['status'], string> = {
@@ -39,6 +39,14 @@ export function RequestsPage() {
     const [searching, setSearching] = useState(false);
     const [requests, setRequests] = useState<MediaRequest[]>([]);
     const [pendingIds, setPendingIds] = useState<Set<number>>(new Set());
+    // Series-only: which result's scope-picker (série entière / saison /
+    // épisode) is currently open, and the season/episode numbers typed into
+    // it. Deliberately a plain numeric input rather than fetching TMDB's
+    // real season list — keeps this a request-flow addition, not a new
+    // TMDB integration surface, per the scoped-down plan for this feature.
+    const [expandedTmdbId, setExpandedTmdbId] = useState<number | null>(null);
+    const [scopeSeason, setScopeSeason] = useState(1);
+    const [scopeEpisode, setScopeEpisode] = useState(1);
 
     const canRequestMovies = integrations?.radarr ?? false;
     const canRequestSeries = integrations?.sonarr ?? false;
@@ -67,7 +75,12 @@ export function RequestsPage() {
         return () => clearTimeout(timer);
     }, [token, query, type]);
 
-    const handleRequest = async (result: TmdbSearchResultItem) => {
+    const handleRequest = async (
+        result: TmdbSearchResultItem,
+        scope: MediaRequestScope = 'series',
+        seasonNumber?: number,
+        episodeNumber?: number
+    ) => {
         if (!token) return;
         setPendingIds((prev) => new Set(prev).add(result.tmdbId));
         try {
@@ -76,7 +89,11 @@ export function RequestsPage() {
                 mediaType: result.mediaType === 'series' ? 'tv' : 'movie',
                 title: result.title,
                 year: result.year ? Number(result.year) : undefined,
+                scope,
+                seasonNumber,
+                episodeNumber,
             });
+            setExpandedTmdbId(null);
             loadRequests();
         } catch (error) {
             console.error('Request failed', error);
@@ -143,23 +160,80 @@ export function RequestsPage() {
                         {results.map((result) => {
                             const already = isAlreadyRequested(result.tmdbId, type);
                             const isPending = pendingIds.has(result.tmdbId);
+                            const isExpanded = expandedTmdbId === result.tmdbId;
                             return (
                                 <div key={result.tmdbId} className="space-y-2">
                                     <div className="aspect-[2/3] rounded-lg overflow-hidden bg-white/5 border border-white/10">
                                         {result.posterUrl && <img src={result.posterUrl} alt={result.title} className="w-full h-full object-cover" />}
                                     </div>
                                     <p className={`text-sm font-medium line-clamp-1 ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>{result.title}</p>
-                                    <button
-                                        onClick={() => handleRequest(result)}
-                                        disabled={already || isPending}
-                                        className={`w-full flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
-                                            already
-                                                ? 'bg-green-600/20 text-green-400 cursor-default'
-                                                : 'bg-white/10 hover:bg-white/20 border border-white/20'
-                                        }`}
-                                    >
-                                        {already ? <><Check size={14} /> Demandé</> : <><Plus size={14} /> {isPending ? '...' : 'Demander'}</>}
-                                    </button>
+
+                                    {!already && type === 'series' && isExpanded ? (
+                                        <div className={`space-y-1.5 p-2 rounded-lg border text-xs ${isDarkMode ? 'bg-white/5 border-white/10' : 'bg-white border-gray-200'}`}>
+                                            <button
+                                                onClick={() => handleRequest(result, 'series')}
+                                                disabled={isPending}
+                                                className="w-full text-left px-2 py-1 rounded hover:bg-white/10"
+                                            >
+                                                Série entière
+                                            </button>
+                                            <div className="flex items-center gap-1">
+                                                <input
+                                                    type="number" min={1} value={scopeSeason}
+                                                    onChange={(e) => setScopeSeason(Math.max(1, Number(e.target.value) || 1))}
+                                                    className={`w-12 px-1.5 py-1 rounded border bg-transparent ${isDarkMode ? 'border-white/20 text-white' : 'border-gray-300 text-gray-900'}`}
+                                                    aria-label="Numéro de saison"
+                                                />
+                                                <button
+                                                    onClick={() => handleRequest(result, 'season', scopeSeason)}
+                                                    disabled={isPending}
+                                                    className="flex-1 text-left px-2 py-1 rounded hover:bg-white/10"
+                                                >
+                                                    Saison {scopeSeason}
+                                                </button>
+                                            </div>
+                                            <div className="flex items-center gap-1">
+                                                <input
+                                                    type="number" min={1} value={scopeSeason}
+                                                    onChange={(e) => setScopeSeason(Math.max(1, Number(e.target.value) || 1))}
+                                                    className={`w-12 px-1.5 py-1 rounded border bg-transparent ${isDarkMode ? 'border-white/20 text-white' : 'border-gray-300 text-gray-900'}`}
+                                                    aria-label="Numéro de saison"
+                                                />
+                                                <span className={isDarkMode ? 'text-gray-500' : 'text-gray-400'}>E</span>
+                                                <input
+                                                    type="number" min={1} value={scopeEpisode}
+                                                    onChange={(e) => setScopeEpisode(Math.max(1, Number(e.target.value) || 1))}
+                                                    className={`w-12 px-1.5 py-1 rounded border bg-transparent ${isDarkMode ? 'border-white/20 text-white' : 'border-gray-300 text-gray-900'}`}
+                                                    aria-label="Numéro d'épisode"
+                                                />
+                                                <button
+                                                    onClick={() => handleRequest(result, 'episode', scopeSeason, scopeEpisode)}
+                                                    disabled={isPending}
+                                                    className="flex-1 text-left px-1 py-1 rounded hover:bg-white/10"
+                                                >
+                                                    Épisode
+                                                </button>
+                                            </div>
+                                            <button
+                                                onClick={() => setExpandedTmdbId(null)}
+                                                className={isDarkMode ? 'text-gray-400 hover:text-white' : 'text-gray-500 hover:text-gray-900'}
+                                            >
+                                                Annuler
+                                            </button>
+                                        </div>
+                                    ) : (
+                                        <button
+                                            onClick={() => (type === 'series' ? setExpandedTmdbId(result.tmdbId) : handleRequest(result))}
+                                            disabled={already || isPending}
+                                            className={`w-full flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                                                already
+                                                    ? 'bg-green-600/20 text-green-400 cursor-default'
+                                                    : 'bg-white/10 hover:bg-white/20 border border-white/20'
+                                            }`}
+                                        >
+                                            {already ? <><Check size={14} /> Demandé</> : <><Plus size={14} /> {isPending ? '...' : 'Demander'}</>}
+                                        </button>
+                                    )}
                                 </div>
                             );
                         })}
@@ -182,7 +256,15 @@ export function RequestsPage() {
                                         {request.posterUrl && <img src={request.posterUrl} alt={request.title} className="w-full h-full object-cover" />}
                                     </div>
                                     <div className="flex-1 min-w-0">
-                                        <p className={`font-medium truncate ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>{request.title}</p>
+                                        <p className={`font-medium truncate flex items-center gap-2 ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
+                                            {request.title}
+                                            {request.scope !== 'series' && request.seasonNumber && (
+                                                <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold ${isDarkMode ? 'bg-white/10 text-gray-300' : 'bg-gray-100 text-gray-600'}`}>
+                                                    <Tv size={10} />
+                                                    S{request.seasonNumber}{request.episodeNumber ? `E${request.episodeNumber}` : ''}
+                                                </span>
+                                            )}
+                                        </p>
                                         <p className={`text-xs ${isDarkMode ? 'text-gray-400' : 'text-gray-600'}`}>{request.year ?? ''}</p>
                                     </div>
                                     <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium ${

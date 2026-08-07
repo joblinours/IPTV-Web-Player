@@ -95,6 +95,53 @@ async function getStreamDuration(sourceUrl: string): Promise<number | null> {
   });
 }
 
+// Browser-safe video codecs we can stream-copy straight through without
+// paying for a full libx264 re-encode. The overwhelming majority of the
+// server's transcode CPU cost is the video re-encode pass, not audio — and
+// the overwhelming majority of "needs transcoding" cases (Jellyfin rips in
+// particular) only actually need the AUDIO fixed (DTS/TrueHD/EAC3 the
+// browser can't decode), the video is already perfectly playable H.264.
+// Re-encoding it anyway was pure waste every single time.
+const COPYABLE_VIDEO_CODECS = new Set(['h264', 'avc1']);
+
+// Helper: probe the source's video codec so the transcode route can decide
+// between `-c:v copy` (near-instant start, negligible CPU) and a full
+// libx264 re-encode (only when the codec genuinely isn't browser-playable,
+// e.g. HEVC/H.265, VC-1, MPEG-2). Fails closed to `null` (unknown) on any
+// error/timeout, which callers treat as "re-encode to be safe".
+async function getVideoCodec(sourceUrl: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    const ffprobe = spawn('ffprobe', [
+      '-v', 'error',
+      '-select_streams', 'v:0',
+      '-show_entries', 'stream=codec_name',
+      '-of', 'default=noprint_wrappers=1:nokey=1:noprint_names=1',
+      sourceUrl,
+    ]);
+
+    let output = '';
+    ffprobe.stdout.on('data', (chunk) => {
+      output += chunk.toString();
+    });
+
+    ffprobe.on('close', () => {
+      const codec = output.trim().toLowerCase();
+      resolve(codec.length > 0 ? codec : null);
+    });
+
+    ffprobe.on('error', () => {
+      resolve(null);
+    });
+
+    setTimeout(() => {
+      if (!ffprobe.killed) {
+        ffprobe.kill('SIGKILL');
+        resolve(null);
+      }
+    }, 5000); // 5 second timeout
+  });
+}
+
 export function registerStreamRoutes(app: FastifyInstance) {
   function logPlaybackTrace(trace: PlaybackTrace) {
     app.log.info({
@@ -464,6 +511,15 @@ export function registerStreamRoutes(app: FastifyInstance) {
       }
     }
 
+    // Most "needs transcoding" cases here are actually just an audio
+    // problem (Jellyfin rips carrying DTS/TrueHD/EAC3 the browser can't
+    // decode) with perfectly playable H.264 video — re-encoding the video
+    // anyway was pure CPU waste on every single playback. Probe first and
+    // stream-copy the video whenever it's already browser-safe; only pay
+    // for the full libx264 re-encode when the codec genuinely requires it.
+    const videoCodec = await getVideoCodec(sourceUrl);
+    const canCopyVideo = videoCodec !== null && COPYABLE_VIDEO_CODECS.has(videoCodec);
+
     const ffmpegArgs = [
       '-hide_banner',
       '-loglevel',
@@ -489,21 +545,15 @@ export function registerStreamRoutes(app: FastifyInstance) {
       ffmpegArgs.push('-ss', seekSeconds.toFixed(3));
     }
 
+    ffmpegArgs.push('-i', sourceUrl, '-map', '0:v:0?', '-map', '0:a:0?', '-c:v');
+
+    if (canCopyVideo) {
+      ffmpegArgs.push('copy');
+    } else {
+      ffmpegArgs.push('libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p');
+    }
+
     ffmpegArgs.push(
-      '-i',
-      sourceUrl,
-      '-map',
-      '0:v:0?',
-      '-map',
-      '0:a:0?',
-      '-c:v',
-      'libx264',
-      '-preset',
-      'veryfast',
-      '-crf',
-      '23',
-      '-pix_fmt',
-      'yuv420p',
       '-c:a',
       'aac',
       '-ac',

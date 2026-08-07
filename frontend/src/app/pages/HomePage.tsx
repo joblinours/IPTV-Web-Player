@@ -4,6 +4,7 @@ import { useAppContext } from '../AppContext';
 import { HeroSlider } from '../components/HeroSlider';
 import { CategoryTabs } from '../components/CategoryTabs';
 import { ContentRow } from '../components/ContentRow';
+import { PaginatedContentGrid } from '../components/PaginatedContentGrid';
 import { ContentRowSkeleton } from '../components/skeletons/ContentRowSkeleton';
 import { HeroSkeleton } from '../components/skeletons/HeroSkeleton';
 import { fetchContentPage, type ContentItem, type SectionType } from '../lib/api';
@@ -12,12 +13,18 @@ const ROW_ITEM_LIMIT = 15;
 const MAX_EXTRA_ROWS = 5;
 
 /**
- * Netflix-style home view: hero slider + the selected category as a
- * horizontal row (from the shared AppContext, same data the old grid used),
- * plus a handful of additional category rows fetched independently so the
- * page reads as "rows of categories" rather than one flat list. Each extra
- * row is a small, capped, self-contained fetch — it never touches the
- * shared catalog state in AppContext.
+ * Netflix-style home view: hero slider always on top, then either —
+ * - "Tous" (default): the selected category as a horizontal row (from the
+ *   shared AppContext, same data the old grid used), plus a handful of
+ *   additional category rows fetched independently so the page reads as
+ *   "rows of categories" rather than one flat list. Each extra row is a
+ *   small, capped, self-contained fetch — it never touches the shared
+ *   catalog state in AppContext.
+ * - a real category selected in the tabs below the hero: the row/extra-rows
+ *   layout is replaced by a full paginated grid (PaginatedContentGrid,
+ *   50-at-a-time, same "load more" mechanism SearchPage already uses) of
+ *   every item in that category — reuses the exact same enrichedItems/
+ *   hasMore/handleLoadMore state, no new fetch logic needed.
  */
 export function HomePage() {
     const location = useLocation();
@@ -25,7 +32,7 @@ export function HomePage() {
     const {
         token, accountId, isDarkMode,
         activeSection, setActiveSection, currentCategories, currentCategory, handleCategoryChange,
-        enrichedItems, isLoadingContent,
+        enrichedItems, isLoadingContent, hasMore, handleLoadMore,
         handlePlay, handleOpenSeriesDetails, handleOpenSchedule, handleOpenRecordings,
         favoritesBySection, toggleFavorite, vodProgressMap, seriesProgressMap,
     } = useAppContext();
@@ -41,9 +48,17 @@ export function HomePage() {
 
     const [extraRows, setExtraRows] = useState<Array<{ categoryId: string; name: string; items: ContentItem[] }>>([]);
     const [extraRowsLoading, setExtraRowsLoading] = useState(false);
+    const isOverviewMode = currentCategory === 'all';
 
+    // The extra-rows preview is only meaningful on the "Tous" overview —
+    // once a real category is selected the grid below takes over, so skip
+    // this fetch entirely (and clear anything already loaded, avoiding a
+    // stale flash of the wrong rows when switching back).
     useEffect(() => {
-        if (!token || !accountId) return;
+        if (!token || !accountId || !isOverviewMode) {
+            setExtraRows([]);
+            return;
+        }
         let cancelled = false;
 
         const realCategories = currentCategories
@@ -83,10 +98,16 @@ export function HomePage() {
         return () => {
             cancelled = true;
         };
-    }, [token, accountId, activeSection, currentCategories, currentCategory]);
+    }, [token, accountId, isOverviewMode, activeSection, currentCategories, currentCategory]);
 
     const favoriteIds = favoritesBySection[activeSection];
     const isFavoritesView = currentCategory === 'favorites';
+    const onOpenDetails =
+        activeSection === 'series'
+            ? handleOpenSeriesDetails
+            : activeSection === 'films'
+            ? (item: ContentItem) => navigate(`/movie/${item.sourceId ?? accountId}/${item.id}`)
+            : undefined;
 
     return (
         <div className="space-y-10">
@@ -115,68 +136,76 @@ export function HomePage() {
                 />
             </div>
 
-            <div className="max-w-[1920px] mx-auto space-y-10">
-                {isLoadingContent && enrichedItems.length === 0 ? (
-                    <ContentRowSkeleton />
-                ) : (
-                    <ContentRow
-                        title={currentCategories.find((c) => c.id === currentCategory)?.name ?? 'Contenu'}
+            {isOverviewMode ? (
+                <div className="max-w-[1920px] mx-auto space-y-10">
+                    {isLoadingContent && enrichedItems.length === 0 ? (
+                        <ContentRowSkeleton />
+                    ) : (
+                        <ContentRow
+                            title={currentCategories.find((c) => c.id === currentCategory)?.name ?? 'Contenu'}
+                            section={activeSection}
+                            items={enrichedItems}
+                            isDarkMode={isDarkMode}
+                            onPlay={handlePlay}
+                            onOpenDetails={onOpenDetails}
+                            onOpenSchedule={activeSection === 'live' ? handleOpenSchedule : undefined}
+                            onOpenRecordings={activeSection === 'live' ? handleOpenRecordings : undefined}
+                            favoriteIds={favoriteIds}
+                            onToggleFavorite={toggleFavorite}
+                            vodProgressMap={vodProgressMap}
+                            seriesProgressMap={seriesProgressMap}
+                            accountId={accountId}
+                        />
+                    )}
+
+                    {extraRows.map((row) => (
+                        <ContentRow
+                            key={row.categoryId}
+                            title={row.name}
+                            section={activeSection}
+                            items={row.items}
+                            isDarkMode={isDarkMode}
+                            onPlay={handlePlay}
+                            onOpenDetails={onOpenDetails}
+                            onOpenSchedule={activeSection === 'live' ? handleOpenSchedule : undefined}
+                            onOpenRecordings={activeSection === 'live' ? handleOpenRecordings : undefined}
+                            favoriteIds={favoriteIds}
+                            onToggleFavorite={toggleFavorite}
+                            vodProgressMap={vodProgressMap}
+                            seriesProgressMap={seriesProgressMap}
+                            accountId={accountId}
+                        />
+                    ))}
+
+                    {extraRowsLoading && extraRows.length === 0 && <ContentRowSkeleton />}
+                </div>
+            ) : (
+                // A real category (or "Favoris") is selected: show every
+                // item in it, 50 at a time, instead of a single row — no
+                // new fetch logic, this is the exact same paginated state
+                // (enrichedItems/hasMore/handleLoadMore) SearchPage already
+                // renders through the same PaginatedContentGrid.
+                <div className="max-w-[1920px] mx-auto px-4 sm:px-6 lg:px-8">
+                    <PaginatedContentGrid
                         section={activeSection}
                         items={enrichedItems}
                         isDarkMode={isDarkMode}
+                        isLoading={isLoadingContent}
+                        hasMore={hasMore}
+                        onLoadMore={handleLoadMore}
                         onPlay={handlePlay}
-                        onOpenDetails={
-                            activeSection === 'series'
-                                ? handleOpenSeriesDetails
-                                : activeSection === 'films'
-                                ? (item) => navigate(`/movie/${accountId}/${item.id}`)
-                                : undefined
-                        }
+                        onOpenDetails={onOpenDetails}
                         onOpenSchedule={activeSection === 'live' ? handleOpenSchedule : undefined}
                         onOpenRecordings={activeSection === 'live' ? handleOpenRecordings : undefined}
+                        isFavoritesView={isFavoritesView}
                         favoriteIds={favoriteIds}
                         onToggleFavorite={toggleFavorite}
                         vodProgressMap={vodProgressMap}
                         seriesProgressMap={seriesProgressMap}
                         accountId={accountId}
                     />
-                )}
-
-                {enrichedItems.length === 0 && !isLoadingContent && isFavoritesView && (
-                    <div className="max-w-[1920px] mx-auto px-4 sm:px-6 lg:px-8">
-                        <div className={`rounded-xl border px-4 py-6 text-sm ${isDarkMode ? 'border-white/10 text-gray-300 bg-white/5' : 'border-gray-200 text-gray-600 bg-white'}`}>
-                            Aucun favori
-                        </div>
-                    </div>
-                )}
-
-                {!isFavoritesView && extraRows.map((row) => (
-                    <ContentRow
-                        key={row.categoryId}
-                        title={row.name}
-                        section={activeSection}
-                        items={row.items}
-                        isDarkMode={isDarkMode}
-                        onPlay={handlePlay}
-                        onOpenDetails={
-                            activeSection === 'series'
-                                ? handleOpenSeriesDetails
-                                : activeSection === 'films'
-                                ? (item) => navigate(`/movie/${accountId}/${item.id}`)
-                                : undefined
-                        }
-                        onOpenSchedule={activeSection === 'live' ? handleOpenSchedule : undefined}
-                        onOpenRecordings={activeSection === 'live' ? handleOpenRecordings : undefined}
-                        favoriteIds={favoriteIds}
-                        onToggleFavorite={toggleFavorite}
-                        vodProgressMap={vodProgressMap}
-                        seriesProgressMap={seriesProgressMap}
-                        accountId={accountId}
-                    />
-                ))}
-
-                {!isFavoritesView && extraRowsLoading && extraRows.length === 0 && <ContentRowSkeleton />}
-            </div>
+                </div>
+            )}
 
             <div className="h-12" />
         </div>

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Outlet, useNavigate, useLocation } from 'react-router';
 import { motion, AnimatePresence, MotionConfig } from 'motion/react';
+import { Toaster, toast } from 'sonner';
 import { usePerformanceMode } from './hooks/usePerformanceMode';
 import { useFavorites } from './hooks/useFavorites';
 import { usePreferences } from './hooks/usePreferences';
@@ -20,6 +21,7 @@ import {
     fetchEpg,
     fetchIntegrations,
     fetchProgress,
+    fetchProgressMerged,
     fetchSeriesInfo,
     fetchSeriesProgress,
     fetchReplayUrl,
@@ -233,12 +235,18 @@ export default function AppShell() {
     const [episodeProgressMap, setEpisodeProgressMap] = useState<EpisodeProgressMap>({});
     const [playerStartTime, setPlayerStartTime] = useState<number | undefined>(undefined);
     const [playerRealDuration, setPlayerRealDuration] = useState<number | undefined>(undefined);
-    const [seriesDetailItemId, setSeriesDetailItemId] = useState<number | null>(null);
+    const [seriesDetailItemId, setSeriesDetailItemId] = useState<number | string | null>(null);
     const [currentSeriesPlayContext, setCurrentSeriesPlayContext] = useState<{
         seriesData: SeriesInfoResponse;
         currentEpisode: SeriesEpisode;
     } | null>(null);
     const currentlyPlayingRef = useRef<CurrentlyPlayingMeta | null>(null);
+    // Tracks which media_sources row the series currently open in the
+    // details page / episode list belongs to — needed because
+    // SeriesEpisode (unlike ContentItem) never carries its own sourceId,
+    // so handlePlayEpisode/handleNext/PreviousEpisode can't derive it from
+    // the episode object alone. Set whenever a series is opened or played.
+    const currentSeriesSourceIdRef = useRef<number | null>(null);
     const needsTranscodeFlagRef = useRef(false);
 
     const [integrations, setIntegrations] = useState<IntegrationsStatus | null>(null);
@@ -300,14 +308,22 @@ export default function AppShell() {
         setShowIptvDialog(!!token && !accountId);
     }, [token, accountId]);
 
+    // Films/series are always browsed merged across every source the user
+    // owns (Xtream + Jellyfin) — no account switch needed to see "on
+    // demand" content alongside the rest of the IPTV catalog. Live TV has
+    // no Jellyfin equivalent (no tuner) and stays scoped to the ambient
+    // accountId, which the Live-only account switcher in Header controls.
+    const isMergedSection = activeSection !== 'live';
+
     useEffect(() => {
-        if (!token || !accountId) return;
+        if (!token) return;
+        if (!isMergedSection && !accountId) return;
 
         let cancelled = false;
 
         const loadCategories = async () => {
             try {
-                const result = await fetchCategories(token, accountId, activeSection);
+                const result = await fetchCategories(token, accountId, activeSection, { merged: isMergedSection });
                 if (cancelled) return;
 
                 setCategoriesBySection((prev) => ({ ...prev, [activeSection]: result.items }));
@@ -335,10 +351,11 @@ export default function AppShell() {
         return () => {
             cancelled = true;
         };
-    }, [activeSection, accountId, selectedCategories, token]);
+    }, [activeSection, accountId, isMergedSection, selectedCategories, token]);
 
     useEffect(() => {
-        if (!token || !accountId) return;
+        if (!token) return;
+        if (!isMergedSection && !accountId) return;
 
         let cancelled = false;
 
@@ -347,6 +364,7 @@ export default function AppShell() {
             try {
                 const result = await fetchContentPage(token, {
                     accountId,
+                    merged: isMergedSection,
                     section: activeSection,
                     categoryId: currentCategory,
                     searchQuery: deferredSearchQuery,
@@ -377,7 +395,7 @@ export default function AppShell() {
         return () => {
             cancelled = true;
         };
-    }, [token, accountId, activeSection, currentCategory, deferredSearchQuery]);
+    }, [token, accountId, isMergedSection, activeSection, currentCategory, deferredSearchQuery]);
 
     useEffect(() => {
         const targets = items
@@ -385,15 +403,17 @@ export default function AppShell() {
             .slice(0, 8);
 
         if (targets.length === 0) return;
-        if (!token || !accountId) return;
+        if (!token) return;
 
         let cancelled = false;
 
         const prefetch = async () => {
             for (const target of targets) {
                 if (cancelled || !target.seriesId) break;
+                const sid = target.sourceId ?? accountId;
+                if (!sid) continue;
                 try {
-                    const details = await fetchSeriesInfo(token, accountId, target.seriesId);
+                    const details = await fetchSeriesInfo(token, sid, target.seriesId);
                     if (cancelled) break;
 
                     const seasonsCount = details.seasons.length;
@@ -417,7 +437,7 @@ export default function AppShell() {
     }, [token, accountId, activeSection, items, seriesStatsMap]);
 
     useEffect(() => {
-        if (!token || !accountId || activeSection !== 'series' || items.length === 0) return;
+        if (!token || activeSection !== 'series' || items.length === 0) return;
 
         const targets = items.filter((item) => !!item.seriesId).slice(0, 8);
         if (targets.length === 0) return;
@@ -427,12 +447,14 @@ export default function AppShell() {
         const load = async () => {
             for (const target of targets) {
                 if (cancelled || !target.seriesId) break;
+                const sid = target.sourceId ?? accountId;
+                if (!sid) continue;
                 try {
-                    const prog = await fetchSeriesProgress(token, accountId, String(target.seriesId));
+                    const prog = await fetchSeriesProgress(token, sid, String(target.seriesId));
                     if (cancelled) break;
                     setSeriesProgressMap((prev) => ({
                         ...prev,
-                        [`${accountId}:${target.seriesId}`]: prog,
+                        [`${sid}:${target.seriesId}`]: prog,
                     }));
                 } catch {
                     // ignore
@@ -445,19 +467,21 @@ export default function AppShell() {
     }, [token, accountId, activeSection, items]);
 
     useEffect(() => {
-        if (!token || !accountId || activeSection !== 'films' || items.length === 0) return;
+        if (!token || activeSection !== 'films' || items.length === 0) return;
 
-        const itemIds = items.slice(0, 50).map((item) => item.id).filter(Boolean);
-        if (itemIds.length === 0) return;
+        const targets = items.slice(0, 50).filter((item) => !!(item.sourceId ?? accountId) && item.id);
+        if (targets.length === 0) return;
+
+        const itemKeys = targets.map((item) => `${item.sourceId ?? accountId}:${item.id}`);
 
         let cancelled = false;
 
-        fetchProgress(token, accountId, 'vod', itemIds)
+        fetchProgressMerged(token, 'vod', itemKeys)
             .then((result) => {
                 if (cancelled) return;
                 const map: VodProgressMap = {};
                 for (const entry of result.items) {
-                    map[`${accountId}:${entry.itemId}`] = entry;
+                    map[`${entry.sourceId}:${entry.itemId}`] = entry;
                 }
                 setVodProgressMap((prev) => ({ ...prev, ...map }));
             })
@@ -467,7 +491,7 @@ export default function AppShell() {
     }, [token, accountId, activeSection, items]);
 
     const handleLoadMore = useCallback(async () => {
-        if (!token || !accountId || isLoadingContent || !hasMore) {
+        if (!token || (!isMergedSection && !accountId) || isLoadingContent || !hasMore) {
             return;
         }
 
@@ -475,6 +499,7 @@ export default function AppShell() {
         try {
             const result = await fetchContentPage(token, {
                 accountId,
+                merged: isMergedSection,
                 section: activeSection,
                 categoryId: currentCategory,
                 searchQuery: deferredSearchQuery,
@@ -488,7 +513,7 @@ export default function AppShell() {
         } finally {
             setIsLoadingContent(false);
         }
-    }, [token, accountId, isLoadingContent, hasMore, activeSection, currentCategory, deferredSearchQuery, nextOffset]);
+    }, [token, accountId, isMergedSection, isLoadingContent, hasMore, activeSection, currentCategory, deferredSearchQuery, nextOffset]);
 
     const handleLogin = async (payload: { appEmail: string; appPassword: string }) => {
         setAuthError(null);
@@ -616,9 +641,41 @@ export default function AppShell() {
             externalId: string,
             debugContext?: PlaybackDebugContext
         ) => {
-            if (!token || !accountId) return [];
+            if (!token) return [];
+            // Every item carries its own originating source (both providers
+            // set it) — playback must always resolve against THAT source,
+            // never whatever happens to be the ambient/default accountId,
+            // now that films/series browse a merged Xtream+Jellyfin view.
+            // accountId only remains a fallback for the few flows that don't
+            // have a full item on hand (e.g. Live, still single-source).
+            const sourceId = item.sourceId ?? accountId;
+            if (!sourceId) return [];
 
             const normalizedContainer = (item.containerExtension ?? '').toLowerCase();
+
+            // Jellyfin ignores containerExtension entirely (buildPlayback on
+            // the backend ignores it) — the extension-permutation loop below
+            // is Xtream-specific and, for Jellyfin, produces 2-3 near-
+            // identical candidates that all resolve to the exact same raw
+            // file. Raw Jellyfin downloads of ripped media very often carry
+            // a non-web audio codec (DTS/TrueHD/EAC3), so trying that same
+            // broken candidate 2-3 times before falling back was the root
+            // cause of the "audio fallback loop then crash" bug — build a
+            // minimal, explicitly ordered list instead: the ffmpeg transcode
+            // (forced AAC audio, cheap now that the server stream-copies
+            // browser-safe video instead of re-encoding it) first, the raw
+            // download last as a pure last-resort.
+            if (item.source === 'jellyfin' && (section === 'films' || section === 'series')) {
+                const transcodeUrl = buildTranscodeUrl({
+                    token, accountId: sourceId, section, itemId: externalId,
+                    containerExtension: normalizedContainer || 'mp4',
+                    durationSeconds: item.durationSeconds ?? undefined,
+                    debugContext,
+                });
+                const rawUrl = buildStreamProxyUrl({ token, accountId: sourceId, section, itemId: externalId, containerExtension: normalizedContainer || 'mp4', debugContext });
+                return [transcodeUrl, rawUrl];
+            }
+
             const base =
                 section === 'live'
                     ? ['ts', 'm3u8', normalizedContainer || 'ts']
@@ -631,19 +688,19 @@ export default function AppShell() {
                         if (section === 'live') {
                             const mustProxy = window.location.protocol === 'https:';
                             if (mustProxy) {
-                                return buildStreamProxyUrl({ token, accountId, section, itemId: externalId, containerExtension: extension, debugContext });
+                                return buildStreamProxyUrl({ token, accountId: sourceId, section, itemId: externalId, containerExtension: extension, debugContext });
                             }
 
-                            const response = await fetchStreamUrl(token, { accountId, section, itemId: externalId, containerExtension: extension, debugContext });
+                            const response = await fetchStreamUrl(token, { accountId: sourceId, section, itemId: externalId, containerExtension: extension, debugContext });
 
                             if (/^http:\/\//i.test(response.url)) {
-                                return buildStreamProxyUrl({ token, accountId, section, itemId: externalId, containerExtension: extension, debugContext });
+                                return buildStreamProxyUrl({ token, accountId: sourceId, section, itemId: externalId, containerExtension: extension, debugContext });
                             }
 
                             return response.url;
                         }
 
-                        return buildStreamProxyUrl({ token, accountId, section, itemId: externalId, containerExtension: extension, debugContext });
+                        return buildStreamProxyUrl({ token, accountId: sourceId, section, itemId: externalId, containerExtension: extension, debugContext });
                     } catch {
                         return null;
                     }
@@ -652,9 +709,9 @@ export default function AppShell() {
 
             if (section === 'films' || section === 'series') {
                 const transcodeUrl = buildTranscodeUrl({
-                    token, accountId, section, itemId: externalId,
+                    token, accountId: sourceId, section, itemId: externalId,
                     containerExtension: normalizedContainer || 'mp4',
-                    durationSeconds: item.durationSeconds,
+                    durationSeconds: item.durationSeconds ?? undefined,
                     debugContext,
                 });
 
@@ -668,9 +725,9 @@ export default function AppShell() {
             if (section === 'live') {
                 urls.push(
                     buildTranscodeUrl({
-                        token, accountId, section, itemId: externalId,
+                        token, accountId: sourceId, section, itemId: externalId,
                         containerExtension: normalizedContainer || 'ts',
-                        durationSeconds: item.durationSeconds,
+                        durationSeconds: item.durationSeconds ?? undefined,
                         debugContext,
                     })
                 );
@@ -692,9 +749,8 @@ export default function AppShell() {
 
     const handlePlayerProgress = useCallback(
         (currentTime: number, duration: number) => {
-            if (!token || !accountId) return;
             const ctx = currentlyPlayingRef.current;
-            if (!ctx) return;
+            if (!token || !ctx) return;
 
             const needsTranscode = needsTranscodeFlagRef.current || undefined;
 
@@ -705,10 +761,14 @@ export default function AppShell() {
 
             const isWatched = duration > 0 && duration - currentTime <= 10;
 
+            // Keyed by ctx.accountId (the item's own source, set correctly
+            // in handlePlay/handlePlayEpisode) — NOT the ambient accountId,
+            // which could be a different source than what's actually
+            // playing now that films/series browse a merged view.
             if (ctx.type === 'vod') {
                 setVodProgressMap((prev) => ({
                     ...prev,
-                    [`${accountId}:${ctx.itemId}`]: {
+                    [`${ctx.accountId}:${ctx.itemId}`]: {
                         itemId: ctx.itemId, currentTime, totalDuration: duration, isWatched,
                         needsTranscode: needsTranscode ?? false, updatedAt: Math.floor(Date.now() / 1000),
                     },
@@ -719,7 +779,7 @@ export default function AppShell() {
                     [ctx.itemId]: { currentTime, totalDuration: duration, isWatched, needsTranscode: needsTranscode ?? false },
                 }));
                 setSeriesProgressMap((prev) => {
-                    const key = `${accountId}:${ctx.seriesId}`;
+                    const key = `${ctx.accountId}:${ctx.seriesId}`;
                     const existing = prev[key];
                     return {
                         ...prev,
@@ -734,14 +794,13 @@ export default function AppShell() {
                 });
             }
         },
-        [token, accountId]
+        [token]
     );
 
     const handlePlayerEnded = useCallback(
         (currentTime: number, duration: number) => {
-            if (!token || !accountId) return;
             const ctx = currentlyPlayingRef.current;
-            if (!ctx) return;
+            if (!token || !ctx) return;
 
             const needsTranscode = needsTranscodeFlagRef.current || undefined;
 
@@ -753,7 +812,7 @@ export default function AppShell() {
             if (ctx.type === 'vod') {
                 setVodProgressMap((prev) => ({
                     ...prev,
-                    [`${accountId}:${ctx.itemId}`]: {
+                    [`${ctx.accountId}:${ctx.itemId}`]: {
                         itemId: ctx.itemId, currentTime, totalDuration: duration, isWatched: true,
                         needsTranscode: needsTranscode ?? false, updatedAt: Math.floor(Date.now() / 1000),
                     },
@@ -764,7 +823,7 @@ export default function AppShell() {
                     [ctx.itemId]: { currentTime, totalDuration: duration, isWatched: true, needsTranscode: needsTranscode ?? false },
                 }));
                 setSeriesProgressMap((prev) => {
-                    const key = `${accountId}:${ctx.seriesId}`;
+                    const key = `${ctx.accountId}:${ctx.seriesId}`;
                     const existing = prev[key];
                     const newWatched = new Set(existing?.watchedEpisodeIds ?? []);
                     newWatched.add(ctx.itemId);
@@ -781,7 +840,7 @@ export default function AppShell() {
                 });
             }
         },
-        [token, accountId]
+        [token]
     );
 
     const handleTranscodeFallback = useCallback(() => {
@@ -802,9 +861,14 @@ export default function AppShell() {
     }, [token, accountId]);
 
     const handleNextEpisode = useCallback(async () => {
-        if (!token || !accountId || !currentSeriesPlayContext) return;
+        if (!token || !currentSeriesPlayContext) return;
         const { seriesData, currentEpisode } = currentSeriesPlayContext;
         const currentSeriesId = currentlyPlayingRef.current?.seriesId;
+        // The currently-playing episode's own source is authoritative — a
+        // Jellyfin series' next episode must stay on Jellyfin, never fall
+        // back to whatever the ambient/default account happens to be.
+        const sid = currentlyPlayingRef.current?.accountId ?? accountId;
+        if (!sid) return;
 
         const next = findNextEpisode(seriesData, currentEpisode.seasonNumber, currentEpisode.episodeNumber);
         if (!next) return;
@@ -813,6 +877,7 @@ export default function AppShell() {
             {
                 id: String(next.id), title: next.title, categoryId: '', poster: next.poster, description: null, genre: null, year: null,
                 rating: next.rating ? String(next.rating) : null, containerExtension: next.containerExtension, streamId: null, seriesId: next.id,
+                sourceId: sid,
             },
             'series', String(next.id),
             { mediaTitle: next.title, seriesTitle: seriesData.info.name, seasonNumber: next.seasonNumber, episodeNumber: next.episodeNumber }
@@ -823,7 +888,7 @@ export default function AppShell() {
         const nextEpProg = episodeProgressMap[String(next.id)];
         const sources = nextEpProg?.needsTranscode ? reorderWithTranscodeFirst(rawSources) : rawSources;
 
-        currentlyPlayingRef.current = { type: 'series_episode', itemId: String(next.id), accountId, seriesId: currentSeriesId, seasonNumber: next.seasonNumber, episodeNumber: next.episodeNumber };
+        currentlyPlayingRef.current = { type: 'series_episode', itemId: String(next.id), accountId: sid, seriesId: currentSeriesId, seasonNumber: next.seasonNumber, episodeNumber: next.episodeNumber };
         setCurrentSeriesPlayContext({ seriesData, currentEpisode: next });
         setPlayerStartTime(undefined);
         setPlayerRealDuration(next.durationSeconds ?? undefined);
@@ -835,9 +900,11 @@ export default function AppShell() {
     }, [token, accountId, currentSeriesPlayContext, resolvePlaybackSources, episodeProgressMap]);
 
     const handlePreviousEpisode = useCallback(async () => {
-        if (!token || !accountId || !currentSeriesPlayContext) return;
+        if (!token || !currentSeriesPlayContext) return;
         const { seriesData, currentEpisode } = currentSeriesPlayContext;
         const currentSeriesId = currentlyPlayingRef.current?.seriesId;
+        const sid = currentlyPlayingRef.current?.accountId ?? accountId;
+        if (!sid) return;
 
         const previous = findPreviousEpisode(seriesData, currentEpisode.seasonNumber, currentEpisode.episodeNumber);
         if (!previous) return;
@@ -846,6 +913,7 @@ export default function AppShell() {
             {
                 id: String(previous.id), title: previous.title, categoryId: '', poster: previous.poster, description: null, genre: null, year: null,
                 rating: previous.rating ? String(previous.rating) : null, containerExtension: previous.containerExtension, streamId: null, seriesId: previous.id,
+                sourceId: sid,
             },
             'series', String(previous.id),
             { mediaTitle: previous.title, seriesTitle: seriesData.info.name, seasonNumber: previous.seasonNumber, episodeNumber: previous.episodeNumber }
@@ -856,7 +924,7 @@ export default function AppShell() {
         const previousEpProg = episodeProgressMap[String(previous.id)];
         const sources = previousEpProg?.needsTranscode ? reorderWithTranscodeFirst(rawSources) : rawSources;
 
-        currentlyPlayingRef.current = { type: 'series_episode', itemId: String(previous.id), accountId, seriesId: currentSeriesId, seasonNumber: previous.seasonNumber, episodeNumber: previous.episodeNumber };
+        currentlyPlayingRef.current = { type: 'series_episode', itemId: String(previous.id), accountId: sid, seriesId: currentSeriesId, seasonNumber: previous.seasonNumber, episodeNumber: previous.episodeNumber };
         setCurrentSeriesPlayContext({ seriesData, currentEpisode: previous });
         setPlayerStartTime(undefined);
         setPlayerRealDuration(previous.durationSeconds ?? undefined);
@@ -869,20 +937,22 @@ export default function AppShell() {
 
     const handleOpenSeriesDetails = useCallback(
         async (item: ContentItem) => {
-            if (!token || !accountId || !item.seriesId) return;
+            const sid = item.sourceId ?? accountId;
+            if (!token || !sid || !item.seriesId) return;
 
             // Netflix-style: a dedicated page instead of a modal — the page
             // reads seriesDetailData/seriesDetailLoading from this same context.
-            if (!location.pathname.startsWith(`/tv/${accountId}/${item.seriesId}`)) {
-                navigate(`/tv/${accountId}/${item.seriesId}`);
+            if (!location.pathname.startsWith(`/tv/${sid}/${item.seriesId}`)) {
+                navigate(`/tv/${sid}/${item.seriesId}`);
             }
 
             setSeriesDetailLoading(true);
             setSeriesDetailOpen(true);
             setSeriesDetailItemId(item.seriesId);
+            currentSeriesSourceIdRef.current = sid;
 
             try {
-                const data = await fetchSeriesInfo(token, accountId, item.seriesId);
+                const data = await fetchSeriesInfo(token, sid, item.seriesId);
                 setSeriesDetailData(data);
 
                 const seasonsCount = data.seasons.length;
@@ -891,7 +961,7 @@ export default function AppShell() {
 
                 const allEpisodeIds = Object.values(data.episodesBySeason).flat().map((ep) => String(ep.id));
                 if (allEpisodeIds.length > 0) {
-                    fetchProgress(token, accountId, 'series_episode', allEpisodeIds)
+                    fetchProgress(token, sid, 'series_episode', allEpisodeIds)
                         .then((result) => {
                             const map: EpisodeProgressMap = {};
                             for (const entry of result.items) {
@@ -912,7 +982,8 @@ export default function AppShell() {
 
     const handlePlay = useCallback(
         async (item: ContentItem) => {
-            if (!token || !accountId) return;
+            const sid = item.sourceId ?? accountId;
+            if (!token || !sid) return;
             try {
                 if (activeSection === 'series') {
                     if (!item.seriesId) {
@@ -920,7 +991,7 @@ export default function AppShell() {
                         return;
                     }
 
-                    const progressKey = `${accountId}:${item.seriesId}`;
+                    const progressKey = `${sid}:${item.seriesId}`;
                     const prog = seriesProgressMap[progressKey];
 
                     if (!prog?.lastEpisode) {
@@ -935,7 +1006,7 @@ export default function AppShell() {
                     let seriesData: SeriesInfoResponse;
                     try {
                         setSeriesDetailLoading(true);
-                        seriesData = await fetchSeriesInfo(token, accountId, item.seriesId);
+                        seriesData = await fetchSeriesInfo(token, sid, item.seriesId);
                     } catch {
                         setSeriesDetailLoading(false);
                         await handleOpenSeriesDetails(item);
@@ -972,6 +1043,7 @@ export default function AppShell() {
                         {
                             id: String(targetEpisode.id), title: targetEpisode.title, categoryId: '', poster: targetEpisode.poster, description: null, genre: null, year: null,
                             rating: targetEpisode.rating ? String(targetEpisode.rating) : null, containerExtension: targetEpisode.containerExtension, streamId: null, seriesId: targetEpisode.id,
+                            sourceId: sid,
                         },
                         'series', String(targetEpisode.id),
                         { mediaTitle: targetEpisode.title, seriesTitle: seriesData.info.name, seasonNumber: targetEpisode.seasonNumber, episodeNumber: targetEpisode.episodeNumber }
@@ -980,7 +1052,8 @@ export default function AppShell() {
                     const epNeedsTranscode = lastEpisode.needsTranscode || (episodeProgressMap[lastEpisode.episodeId]?.needsTranscode ?? false);
                     const sources = epNeedsTranscode ? addSeekToTranscodeSources(reorderWithTranscodeFirst(rawSources), startTimeSec) : rawSources;
 
-                    currentlyPlayingRef.current = { type: 'series_episode', itemId: String(targetEpisode.id), accountId, seriesId: String(item.seriesId), seasonNumber: targetEpisode.seasonNumber, episodeNumber: targetEpisode.episodeNumber };
+                    currentSeriesSourceIdRef.current = sid;
+                    currentlyPlayingRef.current = { type: 'series_episode', itemId: String(targetEpisode.id), accountId: sid, seriesId: String(item.seriesId), seasonNumber: targetEpisode.seasonNumber, episodeNumber: targetEpisode.episodeNumber };
                     setCurrentSeriesPlayContext({ seriesData, currentEpisode: targetEpisode });
                     setPlayerStartTime(startTimeSec);
                     setPlayerRealDuration(targetEpisode.durationSeconds ?? undefined);
@@ -996,11 +1069,11 @@ export default function AppShell() {
                 const externalId = item.itemId ?? (item.streamId ? String(item.streamId) : null);
                 if (!externalId) return;
 
-                const vodProg = vodProgressMap[`${accountId}:${item.id}`];
+                const vodProg = vodProgressMap[`${sid}:${item.id}`];
                 const vodStartTimeSec = vodProg && !vodProg.isWatched && vodProg.currentTime > 0 ? vodProg.currentTime : undefined;
                 const rawVodSources = await resolvePlaybackSources(item, activeSection, externalId, { mediaTitle: item.title });
                 const vodSources = vodProg?.needsTranscode ? addSeekToTranscodeSources(reorderWithTranscodeFirst(rawVodSources), vodStartTimeSec) : rawVodSources;
-                currentlyPlayingRef.current = activeSection === 'live' ? null : { type: 'vod', itemId: item.id, accountId };
+                currentlyPlayingRef.current = activeSection === 'live' ? null : { type: 'vod', itemId: item.id, accountId: sid };
                 setCurrentSeriesPlayContext(null);
                 setPlayerStartTime(vodStartTimeSec);
                 const providerDuration = item.durationSeconds && item.durationSeconds > 0 ? item.durationSeconds : undefined;
@@ -1016,7 +1089,12 @@ export default function AppShell() {
 
     const handlePlayEpisode = useCallback(
         async (episode: SeriesEpisode) => {
-            if (!token || !accountId) return;
+            // SeriesEpisode carries no sourceId of its own — the series
+            // currently open in the details page set this when it loaded
+            // (handleOpenSeriesDetails/handlePlay), so it's always the
+            // right source for any of its episodes.
+            const sid = currentSeriesSourceIdRef.current ?? accountId;
+            if (!token || !sid) return;
 
             try {
                 const epProg = episodeProgressMap[String(episode.id)];
@@ -1026,6 +1104,7 @@ export default function AppShell() {
                     {
                         id: String(episode.id), title: episode.title, categoryId: '', poster: episode.poster, description: null, genre: null, year: null,
                         rating: episode.rating ? String(episode.rating) : null, containerExtension: episode.containerExtension, streamId: null, seriesId: episode.id,
+                        sourceId: sid,
                     },
                     'series', String(episode.id),
                     { mediaTitle: episode.title, seriesTitle: seriesDetailData?.info.name ?? undefined, seasonNumber: episode.seasonNumber, episodeNumber: episode.episodeNumber }
@@ -1034,7 +1113,7 @@ export default function AppShell() {
                 const sources = epProg?.needsTranscode ? addSeekToTranscodeSources(reorderWithTranscodeFirst(rawSources), startTimeSec) : rawSources;
 
                 currentlyPlayingRef.current = {
-                    type: 'series_episode', itemId: String(episode.id), accountId,
+                    type: 'series_episode', itemId: String(episode.id), accountId: sid,
                     seriesId: seriesDetailItemId !== null ? String(seriesDetailItemId) : undefined,
                     seasonNumber: episode.seasonNumber, episodeNumber: episode.episodeNumber,
                 };
@@ -1226,6 +1305,8 @@ export default function AppShell() {
 
                 <AppFooter isDarkMode={isDarkMode} />
 
+                <Toaster theme={isDarkMode ? 'dark' : 'light'} position="top-center" richColors />
+
                 <VideoPlayerModal
                     open={playerOpen}
                     title={playerTitle}
@@ -1247,6 +1328,7 @@ export default function AppShell() {
                     onPreviousEpisode={handlePreviousEpisode}
                     realDuration={playerRealDuration}
                     onTranscodeFallback={handleTranscodeFallback}
+                    onExhausted={() => toast.error('Lecture impossible', { description: `Aucune source lisible n'a été trouvée pour "${playerTitle}".` })}
                     isLive={playerIsLive}
                     keyboardEnabled={playerKeyboardEnabled}
                     onClose={() => {

@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { env, radarrConfigured, sonarrConfigured } from '../config.js';
 import { queryAll, queryOne, execute, nowEpoch } from '../db.js';
 import { computePagination } from '../utils.js';
-import { enqueueWebhook } from '../queue/index.js';
+import { enqueueWebhook, enqueueEpisodeMonitor } from '../queue/index.js';
 import {
   radarrLookupByTmdb,
   sonarrLookupByTvdb,
@@ -13,6 +13,7 @@ import {
   resolveTvdbId,
   arrPost,
   arrDelete,
+  sonarrTriggerCommand,
 } from '../radarrSonarr.js';
 
 const TMDB_IMAGE_BASE = 'https://image.tmdb.org/t/p/w500';
@@ -25,6 +26,18 @@ export function registerRequestsRoutes(app: FastifyInstance) {
       title: z.string().max(512).optional(),
       year: z.coerce.number().int().min(1900).max(2100).optional(),
       posterPath: z.string().max(255).optional(),
+      // Series-only — a movie request is always "the whole movie" (Radarr
+      // has no notion of partial requests). Defaults to 'series' (whole
+      // series) so existing callers are unaffected.
+      scope: z.enum(['series', 'season', 'episode']).optional().default('series'),
+      seasonNumber: z.coerce.number().int().min(1).max(100).optional(),
+      episodeNumber: z.coerce.number().int().min(1).max(10000).optional(),
+    }).refine((data) => data.scope === 'series' || typeof data.seasonNumber === 'number', {
+      message: 'seasonNumber is required for scope "season" or "episode"',
+      path: ['seasonNumber'],
+    }).refine((data) => data.scope !== 'episode' || typeof data.episodeNumber === 'number', {
+      message: 'episodeNumber is required for scope "episode"',
+      path: ['episodeNumber'],
     });
 
     const parsed = bodySchema.safeParse(request.body);
@@ -40,9 +53,18 @@ export function registerRequestsRoutes(app: FastifyInstance) {
       return reply.code(503).send({ message: 'Sonarr is not configured yet' });
     }
 
+    // 0 = "not applicable to this scope" — movies and whole-series requests
+    // always sentinel both to 0; only season/episode scopes set them, see
+    // migration 004_request_scope for why these are NOT NULL rather than
+    // nullable (MySQL treats NULL as distinct in a unique key, which would
+    // defeat the dedupe below).
+    const scope = service === 'sonarr' ? parsed.data.scope : 'series';
+    const seasonSentinel = scope === 'series' ? 0 : (parsed.data.seasonNumber ?? 0);
+    const episodeSentinel = scope === 'episode' ? (parsed.data.episodeNumber ?? 0) : 0;
+
     const existing = await queryOne<{ id: number; status: string }>(
-      'SELECT id, status FROM media_requests WHERE user_id = ? AND media_type = ? AND tmdb_id = ?',
-      [request.user.userId, parsed.data.mediaType, parsed.data.tmdbId]
+      'SELECT id, status FROM media_requests WHERE user_id = ? AND media_type = ? AND tmdb_id = ? AND season_number = ? AND episode_number = ?',
+      [request.user.userId, parsed.data.mediaType, parsed.data.tmdbId, seasonSentinel, episodeSentinel]
     );
     if (existing) {
       return { id: existing.id, status: existing.status, alreadyRequested: true };
@@ -122,28 +144,68 @@ export function registerRequestsRoutes(app: FastifyInstance) {
     }
 
     const insertResult = await execute(
-      `INSERT INTO media_requests(user_id, tmdb_id, tvdb_id, media_type, title, year, poster_path, status, service, requested_at, updated_at)
-       VALUES (?, ?, ?, 'tv', ?, ?, ?, 'pending', 'sonarr', ?, ?)`,
+      `INSERT INTO media_requests(user_id, tmdb_id, tvdb_id, media_type, scope, title, year, season_number, episode_number, poster_path, status, service, requested_at, updated_at)
+       VALUES (?, ?, ?, 'tv', ?, ?, ?, ?, ?, ?, 'pending', 'sonarr', ?, ?)`,
       [
         request.user.userId,
         parsed.data.tmdbId,
         tvdbId,
+        scope,
         parsed.data.title ?? candidate.title ?? 'Untitled',
         parsed.data.year ?? null,
+        seasonSentinel,
+        episodeSentinel,
         parsed.data.posterPath ?? null,
         now,
         now,
       ]
     );
 
+    // Per-scope Sonarr payload: 'series' keeps the exact behavior this
+    // always had (monitor everything, search on add). 'season'/'episode'
+    // instead monitor only the target season in the series object itself
+    // (addOptions.monitor:'none' so Sonarr doesn't override that per-season
+    // choice on add) and rely on an explicit follow-up command for the
+    // actual search, rather than the fire-and-maybe-happens addOptions flag.
+    const seasons = (candidate.seasons ?? []).map((season) =>
+      scope === 'series' ? season : { ...season, monitored: season.seasonNumber === parsed.data.seasonNumber }
+    );
+    const addOptions =
+      scope === 'series'
+        ? { monitor: 'all' as const, searchForMissingEpisodes: true, searchForCutoffUnmetEpisodes: false }
+        : scope === 'season'
+        ? { monitor: 'none' as const, searchForMissingEpisodes: true, searchForCutoffUnmetEpisodes: false }
+        : { monitor: 'none' as const, searchForMissingEpisodes: false, searchForCutoffUnmetEpisodes: false };
+
     const addResult = await arrPost<{ id: number }>('sonarr', '/api/v3/series', {
       ...candidate,
+      seasons,
       qualityProfileId: env.sonarrQualityProfileId,
       rootFolderPath: env.sonarrRootFolder,
       monitored: true,
       seasonFolder: true,
-      addOptions: { monitor: 'all', searchForMissingEpisodes: true, searchForCutoffUnmetEpisodes: false },
+      addOptions,
     });
+
+    // Triggers the actual scoped search once the series exists in Sonarr
+    // (either just-added, or already there from an earlier request — see
+    // the "already exists" fallback below, which must apply this too
+    // rather than short-circuit before it).
+    const applyScopedFollowUp = async (sonarrSeriesId: number) => {
+      if (scope === 'season') {
+        await sonarrTriggerCommand('SeasonSearch', { seriesId: sonarrSeriesId, seasonNumber: parsed.data.seasonNumber });
+      } else if (scope === 'episode') {
+        // Sonarr populates its episode list asynchronously after add — the
+        // monitor+search itself happens in a background job, not inline
+        // here (see queue/workers/mediaRequests.ts's processEpisodeMonitor).
+        await enqueueEpisodeMonitor({
+          requestId: insertResult.insertId,
+          sonarrSeriesId,
+          seasonNumber: parsed.data.seasonNumber!,
+          episodeNumber: parsed.data.episodeNumber!,
+        });
+      }
+    };
 
     if (addResult.ok && addResult.body) {
       await execute('UPDATE media_requests SET status = ?, service_item_id = ?, updated_at = ? WHERE id = ?', [
@@ -152,9 +214,14 @@ export function registerRequestsRoutes(app: FastifyInstance) {
         nowEpoch(),
         insertResult.insertId,
       ]);
+      await applyScopedFollowUp(addResult.body.id).catch(() => {});
       return { id: insertResult.insertId, status: 'added', alreadyRequested: false };
     }
 
+    // "Already exists" (another request already added this series) is a
+    // success, not a failure — but a season/episode-scoped request against
+    // an already-existing series still needs its own monitor+search applied
+    // against that existing series id, not silently skipped.
     const existingRemote = await sonarrFindExistingByTvdb(tvdbId);
     if (existingRemote) {
       await execute('UPDATE media_requests SET status = ?, service_item_id = ?, updated_at = ? WHERE id = ?', [
@@ -163,6 +230,7 @@ export function registerRequestsRoutes(app: FastifyInstance) {
         nowEpoch(),
         insertResult.insertId,
       ]);
+      await applyScopedFollowUp(existingRemote.id).catch(() => {});
       return { id: insertResult.insertId, status: 'added', alreadyRequested: false };
     }
 
@@ -193,7 +261,7 @@ export function registerRequestsRoutes(app: FastifyInstance) {
       : [request.user.userId];
 
     const rows = await queryAll<any>(
-      `SELECT id, tmdb_id, media_type, title, year, poster_path, status, service, requested_at, updated_at
+      `SELECT id, tmdb_id, media_type, scope, season_number, episode_number, title, year, poster_path, status, service, requested_at, updated_at
        FROM media_requests WHERE user_id = ? ${whereStatus} ORDER BY requested_at DESC`,
       params
     );
@@ -206,6 +274,9 @@ export function registerRequestsRoutes(app: FastifyInstance) {
         id: row.id,
         tmdbId: row.tmdb_id,
         mediaType: row.media_type,
+        scope: row.scope,
+        seasonNumber: row.season_number > 0 ? row.season_number : null,
+        episodeNumber: row.episode_number > 0 ? row.episode_number : null,
         title: row.title,
         year: row.year,
         posterUrl: row.poster_path ? `${TMDB_IMAGE_BASE}${row.poster_path}` : null,

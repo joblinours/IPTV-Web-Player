@@ -79,14 +79,88 @@ export function registerProgressRoutes(app: FastifyInstance) {
 
   app.get('/api/progress', { preHandler: [app.authenticate] }, async (request: any, reply) => {
     const querySchema = z.object({
-      accountId: z.coerce.number().int().positive(),
+      accountId: z.coerce.number().int().positive().optional(),
+      mode: z.enum(['single', 'merged']).optional().default('single'),
       type: z.enum(['vod', 'series_episode']),
       itemIds: z.string().optional(),
+      // Merged mode: comma list of `${sourceId}:${itemId}` pairs — a bare
+      // itemId isn't unique once more than one source is in play, so the
+      // caller must tell us which source each item came from.
+      itemKeys: z.string().optional(),
     });
 
     const parsed = querySchema.safeParse(request.query);
     if (!parsed.success) {
       return reply.code(400).send({ message: 'Invalid query' });
+    }
+
+    if (parsed.data.mode === 'merged') {
+      const pairs = (parsed.data.itemKeys ?? '')
+        .split(',')
+        .map((raw) => raw.trim())
+        .filter(Boolean)
+        .slice(0, 200)
+        .map((raw) => {
+          const separatorIndex = raw.indexOf(':');
+          if (separatorIndex <= 0) return null;
+          const sourceId = Number(raw.slice(0, separatorIndex));
+          const itemId = raw.slice(separatorIndex + 1);
+          return Number.isFinite(sourceId) && itemId ? { sourceId, itemId } : null;
+        })
+        .filter((pair): pair is { sourceId: number; itemId: string } => pair !== null);
+
+      if (pairs.length === 0) {
+        return { items: [] };
+      }
+
+      const itemIdsBySource = new Map<number, string[]>();
+      for (const pair of pairs) {
+        const list = itemIdsBySource.get(pair.sourceId) ?? [];
+        list.push(pair.itemId);
+        itemIdsBySource.set(pair.sourceId, list);
+      }
+
+      const items: Array<{ sourceId: number; itemId: string; currentTime: number; totalDuration: number; isWatched: boolean; needsTranscode: boolean; updatedAt: number }> = [];
+      for (const [sourceId, itemIds] of itemIdsBySource) {
+        const source = await queryOne<{ id: number }>(
+          'SELECT id FROM media_sources WHERE id = ? AND user_id = ?',
+          [sourceId, request.user.userId]
+        );
+        if (!source) continue; // silently skip — not an error, just nothing to report for a source the user no longer owns
+
+        const placeholders = itemIds.map(() => '?').join(',');
+        const rows = await queryAll<{
+          item_id: string;
+          position_seconds: number;
+          total_duration: number;
+          is_watched: number;
+          needs_transcode: number;
+          updated_at: number;
+        }>(
+          `SELECT item_id, position_seconds, total_duration, is_watched, needs_transcode, updated_at
+           FROM watch_progress
+           WHERE user_id = ? AND source_id = ? AND type = ? AND item_id IN (${placeholders})`,
+          [request.user.userId, sourceId, parsed.data.type, ...itemIds]
+        );
+
+        for (const row of rows) {
+          items.push({
+            sourceId,
+            itemId: row.item_id,
+            currentTime: row.position_seconds,
+            totalDuration: row.total_duration,
+            isWatched: Boolean(row.is_watched),
+            needsTranscode: Boolean(row.needs_transcode),
+            updatedAt: row.updated_at,
+          });
+        }
+      }
+
+      return { items };
+    }
+
+    if (!parsed.data.accountId) {
+      return reply.code(400).send({ message: 'accountId is required outside merged mode' });
     }
 
     const source = await queryOne<{ id: number }>(
