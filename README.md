@@ -192,13 +192,15 @@ Frontend available at `http://localhost:8080`.
 
 ## Run with Docker Compose
 
-The full stack (MySQL, Redis, Jellyfin, Radarr, Sonarr, Prowlarr, qBittorrent, backend, frontend) is defined in the root `docker-compose.yml`. **No `.env` file is used for this deployment path** — every variable is declared directly in `docker-compose.yml`'s `environment:` blocks and resolved from `${VAR}` substitution, which Compose reads from the shell/systemd environment. Required secrets (`JWT_SECRET`, `APP_ENCRYPTION_SECRET`, `MYSQL_PASSWORD`, `MYSQL_ROOT_PASSWORD`) use `${VAR:?message}`, so `docker compose up` refuses to start with a clear error if they're missing instead of booting insecurely.
+The full stack (MySQL, Redis, Jellyfin, Radarr, Sonarr, Prowlarr, qBittorrent, backend, frontend) is defined in the root `docker-compose.yml`. `backend`/`frontend` are pulled as pre-built images (`image:`, not `build:`) — CI (`.github/workflows/docker-publish.yml`) builds and pushes them to Docker Hub, so this compose file is self-contained and works from just the YAML (e.g. pasted directly into Portainer as a stack), no source checkout required.
 
-Export the required values however you prefer on the server — a systemd `EnvironmentFile=`, your process manager's secret store, a shell profile — just not as a file inside this repo. See [`CUTOVER.md`](CUTOVER.md) for the full first-deploy/migration runbook and the complete variable list.
+**No `.env` file is used for this deployment path** — every variable is declared directly in `docker-compose.yml`'s `environment:` blocks and resolved from `${VAR}` substitution (Compose reads it from the shell/systemd environment; Portainer has its own "Environment variables" panel for the same purpose). Required secrets (`JWT_SECRET`, `APP_ENCRYPTION_SECRET`, `MYSQL_PASSWORD`, `MYSQL_ROOT_PASSWORD`) use `${VAR:?message}`, so deploying refuses to start with a clear error if they're missing instead of booting insecurely.
+
+Export the required values however you prefer on the server — a systemd `EnvironmentFile=`, your process manager's secret store, a shell profile, or Portainer's stack env var panel — just not as a file inside this repo. See [`CUTOVER.md`](CUTOVER.md) for the full first-deploy/migration runbook and the complete variable list.
 
 ```bash
 export JWT_SECRET=... APP_ENCRYPTION_SECRET=... MYSQL_ROOT_PASSWORD=... MYSQL_PASSWORD=...
-docker compose up --build -d
+docker compose up -d
 ```
 
 Services (once configured — see `CUTOVER.md`):

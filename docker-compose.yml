@@ -146,9 +146,13 @@ services:
       - iptv-net
 
   backend:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    # Pre-built by CI (.github/workflows/docker-publish.yml) and pushed to
+    # Docker Hub — NOT `build:`. Portainer stacks deployed from a pasted/
+    # uploaded compose file only have the YAML itself, not this repo's
+    # source tree, so `build: context: ./backend` fails with "path not
+    # found". Pulling the already-built :dev image is also just what we
+    # want here: it's the exact image CI just tested/built from this branch.
+    image: ${DOCKERHUB_NAMESPACE:-joblinours}/iptv-web-player-backend:${IMAGE_TAG:-dev}
     container_name: iptv-backend
     restart: unless-stopped
     # No .env file, by design: every variable below is resolved from the
@@ -253,11 +257,8 @@ services:
       - iptv-net
 
   frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-      args:
-        VITE_API_BASE_URL: ""
+    # Same reasoning as backend above — pre-built by CI, pulled by tag.
+    image: ${DOCKERHUB_NAMESPACE:-joblinours}/iptv-web-player-frontend:${IMAGE_TAG:-dev}
     container_name: iptv-frontend
     restart: unless-stopped
     ports:
