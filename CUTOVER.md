@@ -1,20 +1,21 @@
 # Bascule vers la stack complète (MySQL + Redis + Jellyfin + Radarr/Sonarr + Prowlarr/qBittorrent)
 
-Ce document est le guide de bascule pour passer de la version actuelle (SQLite, 2 conteneurs) à la nouvelle stack (MySQL, Redis, Jellyfin, Radarr, Sonarr, Prowlarr, qBittorrent). **À suivre dans l'ordre.** Ne pas pousser la branche tant que la checklist "Avant de commencer" n'est pas cochée — Watchtower tire les images `:dev` automatiquement sur ce serveur, donc un push déclenche un déploiement quasi immédiat.
+Ce document est le guide de bascule pour passer de la version actuelle (SQLite, 2 conteneurs) à la nouvelle stack (MySQL, Redis, Jellyfin, Radarr, Sonarr, Prowlarr, qBittorrent).
+
+**Contrainte de déploiement : Portainer, en une seule salve.** Le déploiement se fait en uploadant `docker-compose.yml` comme stack dans Portainer, qui télécharge les images et démarre tous les conteneurs lui-même — il n'y a pas de séquence manuelle `docker compose up -d <service>` par étapes. Ce guide est écrit pour ce mode de fonctionnement : l'ordre de démarrage (mysql/redis → backend → le reste) est déjà garanti par les `depends_on: condition: service_healthy` du fichier, donc un déploiement en un coup reste sûr — la seule étape qui reste **manuelle après coup** est le script de migration SQLite→MySQL (voir Étape 3), parce qu'une migration de données n'est délibérément pas automatique.
 
 ## Avant de commencer (checklist)
 
-- [ ] **Watchtower mis en pause** pour `iptv-backend`/`iptv-frontend` (ou globalement) le temps de la bascule — sinon le nouveau backend peut être tiré avant que MySQL/Redis existent et boucler en crash.
-- [ ] Mot de passe MySQL choisi (`MYSQL_PASSWORD`) et mot de passe root (`MYSQL_ROOT_PASSWORD`) — deux valeurs différentes, longues, prêtes à être **exportées** (pas de fichier `.env`, voir étape 2).
-- [ ] `backend/.env` **actuellement présent sur le serveur** (déploiement en cours) sous la main, pour en récupérer **verbatim** `JWT_SECRET` et `APP_ENCRYPTION_SECRET` avant de l'abandonner (ne jamais régénérer ces valeurs — voir "Le piège n°1" plus bas). C'est la dernière fois que ce fichier sert à quelque chose : la nouvelle stack ne lit plus de `.env` du tout.
-- [ ] Espace disque confirmé pour `/media` (déjà fait : 500 Go+, largement suffisant).
-- [ ] Stockage média sur le mirror ZFS, pas un volume Docker — voir "Étape 0" ci-dessous.
+- [ ] **Watchtower mis en pause** pour `iptv-backend`/`iptv-frontend` (ou globalement) — sinon Watchtower peut re-tirer une image entre deux de vos actions pendant la bascule.
+- [ ] Snapshot machine pris **avant** de mettre à jour la stack dans Portainer (déjà fait — voir "Étape 1" pour ce qu'il couvre et ne couvre pas).
+- [ ] Variables d'environnement prêtes à saisir dans le panneau **Environment variables** de Portainer (voir Étape 2) — mot de passe MySQL, mot de passe root MySQL, `JWT_SECRET`/`APP_ENCRYPTION_SECRET` récupérés depuis le déploiement actuel.
+- [ ] Stockage média sur le mirror ZFS prêt — voir "Étape 0" ci-dessous.
 - [ ] Compte Usenet : **abandonné**, remplacé par Prowlarr + qBittorrent (100% gratuit, pas d'abonnement).
 - [ ] Accès au compte C411 (tracker privé) prêt — URL + clé API/passkey, à ajouter dans Prowlarr après le déploiement.
 
 ## Le piège n°1 (à lire avant tout le reste)
 
-`APP_ENCRYPTION_SECRET` chiffre les mots de passe IPTV stockés en base. S'il diffère ne serait-ce que d'un caractère entre l'ancien déploiement et le nouveau, la migration **réussira en apparence à 100%** et tous les comptes IPTV deviendront **définitivement illisibles** — l'erreur n'apparaît que plus tard, en essayant de lire un flux. Le script de migration vérifie ça (`--verify-secrets`) et refuse de committer si un seul secret ne se déchiffre pas, mais seulement si vous lui donnez le bon secret pour commencer. **Copiez `APP_ENCRYPTION_SECRET` tel quel depuis le `backend/.env` actuellement en prod, puis exportez-le** (voir étape 2) — ne le mettez pas dans un nouveau fichier.
+`APP_ENCRYPTION_SECRET` chiffre les mots de passe IPTV stockés en base. S'il diffère ne serait-ce que d'un caractère entre l'ancien déploiement et le nouveau, la migration **réussira en apparence à 100%** et tous les comptes IPTV deviendront **définitivement illisibles** — l'erreur n'apparaît que plus tard, en essayant de lire un flux. Le script de migration vérifie ça (`--verify-secrets`) et refuse de committer si un seul secret ne se déchiffre pas, mais seulement si vous lui donnez le bon secret pour commencer. **Récupérez `APP_ENCRYPTION_SECRET` tel quel depuis la stack Portainer actuelle (onglet Environment variables du déploiement en cours), et resaisissez-le à l'identique dans la nouvelle stack.**
 
 ## Étape 0 — Préparer le stockage média sur le mirror ZFS
 
@@ -39,97 +40,89 @@ Résultat attendu :
 
 Comme `downloads/complete` et `movies`/`series` sont sur ce même point de montage, les imports Radarr/Sonarr sont des hardlinks instantanés, pas des copies.
 
-## Étape 1 — Sauvegarde (obligatoire, avant tout)
+## Étape 1 — Sauvegarde
+
+**Vous avez déjà un snapshot machine** pris avant la bascule — c'est suffisant comme filet de sécurité principal (il couvre le volume `backend_data` avec le SQLite, les images Docker déjà présentes, toute la config). Deux nuances :
+
+- Restaurer un snapshot revient sur **toute la VM** à cet instant, pas juste StreamHub — si vous touchez à autre chose sur cette machine entre le snapshot et la bascule, un rollback snapshot effacerait aussi ces changements.
+- Un snapshot n'est **pas une vérification** — il ne dit rien sur l'état du fichier SQLite au moment T. Ces deux commandes sont gratuites et donnent des chiffres indépendants à comparer avec ce que le script de migration annoncera à l'Étape 3 (`--verify`) :
 
 ```bash
-cd /chemin/vers/IPTV-Web-Player   # sur le serveur
-
-docker compose stop backend
-
-mkdir -p backups
-docker run --rm -v backend_data:/data -v "$PWD/backups:/backup" alpine \
-  sh -c 'cp -a /data/. /backup/app-db-'"$(date +%F-%H%M%S)"'/'
-
-# Vérifier que la sauvegarde est saine et noter les compteurs de lignes
-sqlite3 backups/app-db-*/app.db "PRAGMA integrity_check;"
-sqlite3 backups/app-db-*/app.db \
+# Chemin exact du volume : `docker volume inspect <projet>_backend_data` si besoin
+sqlite3 /var/lib/docker/volumes/<...>_backend_data/_data/app.db "PRAGMA integrity_check;"
+sqlite3 /var/lib/docker/volumes/<...>_backend_data/_data/app.db \
   "SELECT 'users',COUNT(*) FROM users UNION ALL SELECT 'accounts',COUNT(*) FROM iptv_accounts
    UNION ALL SELECT 'fav',COUNT(*) FROM favorites UNION ALL SELECT 'wp',COUNT(*) FROM watch_progress
-   UNION ALL SELECT 'prefs',COUNT(*) FROM user_preferences;" | tee backups/rowcounts.txt
-
-# Noter le digest de l'image actuelle, pour un rollback en une commande si besoin
-docker inspect --format '{{index .RepoDigests 0}}' iptv-backend | tee backups/rollback-image.txt
+   UNION ALL SELECT 'prefs',COUNT(*) FROM user_preferences;"
 ```
 
-## Étape 2 — Préparer les variables d'environnement (aucun fichier `.env`)
+Notez ces chiffres quelque part (pas besoin de fichier dans le repo) — vous les comparerez à la sortie du script de migration.
 
-`docker-compose.yml` ne lit **aucun fichier `.env`** — chaque variable est déclarée dans les blocs `environment:` du fichier et résolue via `${VAR}`, que Compose va chercher dans l'environnement du shell/service qui lance `docker compose`. Choisissez le mécanisme qui vous convient sur le serveur (unité systemd avec `EnvironmentFile=/etc/streamhub/secrets.env` pointant vers un fichier **hors du repo**, profil shell, secret store de votre gestionnaire de process...) — l'important est que rien de sensible ne finisse jamais dans un fichier suivi par git.
+## Étape 2 — Variables d'environnement (dans Portainer, aucun fichier `.env`)
 
-Variables à exporter avant `docker compose up` (reprendre `JWT_SECRET`/`APP_ENCRYPTION_SECRET` **verbatim** depuis le déploiement actuel) :
-```bash
-export JWT_SECRET='<valeur actuelle, copiée telle quelle>'
-export APP_ENCRYPTION_SECRET='<valeur actuelle, copiée telle quelle>'
-export MYSQL_ROOT_PASSWORD='<choisir un mot de passe long>'
-export MYSQL_PASSWORD='<choisir un autre mot de passe long>'
-export REQUESTS_WEBHOOK_SECRET="$(openssl rand -hex 32)"
-export PUID=1000 PGID=1000 TZ=Europe/Paris
-export CORS_ORIGIN=http://192.168.1.13:8081
-export JELLYFIN_PUBLISHED_URL=http://192.168.1.13:8096
-```
+`docker-compose.yml` ne lit **aucun fichier `.env`** — chaque variable est déclarée dans les blocs `environment:` du fichier via `${VAR}`. Dans Portainer, ces valeurs se saisissent dans le panneau **Environment variables** de la stack (Stacks → votre stack → Environment variables), pas dans un fichier du repo — c'est l'équivalent exact d'un export shell, géré par Portainer lui-même.
 
-Le reste (`MYSQL_DATABASE`, `MYSQL_USER`, hôtes internes Redis/MySQL/Jellyfin/Radarr/Sonarr, TTLs...) a déjà des valeurs par défaut sensées directement dans `docker-compose.yml` — rien à exporter pour ceux-là. `JELLYFIN_API_KEY`/`RADARR_API_KEY`/`RADARR_QUALITY_PROFILE_ID`/`SONARR_API_KEY`/`SONARR_QUALITY_PROFILE_ID`/`TMDB_API_KEY` restent vides pour l'instant (défaut `""` ou `0`) — ils s'exportent après la config manuelle (étape 5) puis un `docker compose up -d backend` pour les prendre en compte.
+À saisir (reprendre `JWT_SECRET`/`APP_ENCRYPTION_SECRET` **verbatim** depuis la stack actuelle) :
 
-**Si vous utilisez systemd**, la manière la plus propre d'exporter ces valeurs durablement est un `EnvironmentFile=` dans l'unité qui lance `docker compose up`, pointant vers un fichier réservé (ex. `/etc/streamhub/secrets.env`, permissions `600`, **en dehors du répertoire du repo** donc jamais suivi par git) — cela reste conceptuellement un fichier KEY=VALUE, mais il ne vit jamais dans le dépôt ni n'est jamais poussé sur GitHub.
+| Variable | Valeur |
+|---|---|
+| `JWT_SECRET` | *(copié tel quel depuis la stack actuelle)* |
+| `APP_ENCRYPTION_SECRET` | *(copié tel quel depuis la stack actuelle — voir "Le piège n°1")* |
+| `MYSQL_ROOT_PASSWORD` | *(nouveau mot de passe long)* |
+| `MYSQL_PASSWORD` | *(un autre nouveau mot de passe long)* |
+| `REQUESTS_WEBHOOK_SECRET` | sortie de `openssl rand -hex 32` |
+| `PUID` / `PGID` | `1000` / `1000` |
+| `TZ` | `Europe/Paris` |
+| `CORS_ORIGIN` | `http://192.168.1.13:8081` |
+| `JELLYFIN_PUBLISHED_URL` | `http://192.168.1.13:8096` |
 
-## Étape 3 — Déployer et migrer
+Le reste (`MYSQL_DATABASE`, `MYSQL_USER`, hôtes internes Redis/MySQL/Jellyfin/Radarr/Sonarr, TTLs...) a déjà des valeurs par défaut sensées directement dans `docker-compose.yml` — inutile de les saisir. Laissez `JELLYFIN_API_KEY`/`RADARR_API_KEY`/`RADARR_QUALITY_PROFILE_ID`/`SONARR_API_KEY`/`SONARR_QUALITY_PROFILE_ID`/`TMDB_API_KEY` vides pour l'instant — ils se remplissent après la config manuelle (Étape 5), puis un redéploiement de la stack (juste le service `backend` si Portainer le permet, sinon toute la stack — sans risque, ce sont des services déjà tous démarrés).
 
-```bash
-git pull                                    # récupère cette branche une fois poussée
-docker compose build backend frontend       # ou `docker compose pull` si vous préférez les images CI
-docker compose up -d mysql redis            # attendre qu'ils soient "healthy" (docker compose ps)
-docker compose up -d backend                # démarre, crée les tables (001_init) sur une base MySQL vide
+## Étape 3 — Déployer la stack complète et migrer les données
 
-docker compose exec backend node dist/scripts/migrate-sqlite-to-mysql.js \
-  --sqlite /data-legacy/app.db --verify --verify-secrets
-```
-- Sortie attendue : compteurs de lignes qui matchent, `verify-secrets: N/N decrypted OK`, `SUCCESS — transaction committed.`
-- **Un exit code non nul = rien n'a été écrit** (rollback automatique) → voir "Rollback" ci-dessous, ne pas continuer.
+**Tout se déploie en une fois** — Portainer démarre les 9 services ensemble. Grâce à `depends_on: condition: service_healthy` dans `docker-compose.yml`, l'ordre reste garanti : `mysql`/`redis` doivent être `healthy` avant que `backend` démarre réellement (il crée alors automatiquement les tables MySQL vides). `frontend` et tous les services média (Jellyfin/Radarr/Sonarr/Prowlarr/qBittorrent) démarrent en parallèle, sans dépendre de `backend`.
 
-```bash
-docker compose up -d frontend
-```
+**Point important : il y a une fenêtre entre "la stack est démarrée" et "les données sont migrées"** où le site est joignable sur `http://192.168.1.13:8081/` mais pointe vers une base MySQL **vide** (aucun compte). Ce n'est pas grave en soi, mais :
+- **N'ouvrez pas le site et ne vous connectez pas** pendant cette fenêtre — si un compte est créé sur la base vide, le script de migration refusera de continuer (il exige une base cible vide, sauf `--force-truncate`, pour ne jamais écraser silencieusement des données).
+- Enchaînez directement sur la migration ci-dessous dès que la stack est up.
 
-**Smoke test** (avant de considérer la bascule réussie) :
-1. `curl http://192.168.1.13:8081/api/system/health` → `{"mysql":true,"redis":true}`
-2. Se connecter avec `test@test.com` / `testtest`
-3. Vérifier que le compte IPTV existant est toujours là et que les catégories/contenus chargent
-4. Lancer un VOD déjà commencé avant la bascule → vérifie que la progression a survécu
+1. **Dans Portainer** : Stacks → mettre à jour votre stack avec le nouveau `docker-compose.yml` (+ les variables de l'Étape 2) → déployer. Attendre que `iptv-mysql` et `iptv-redis` passent `healthy` (colonne Status), puis que `iptv-backend` démarre.
 
-## Étape 4 — Déployer Jellyfin / Radarr / Sonarr / Prowlarr / qBittorrent
+2. **Lancer la migration via la console Portainer** (Containers → `iptv-backend` → bouton **Console** → Connect avec `/bin/sh`) :
+   ```sh
+   node dist/scripts/migrate-sqlite-to-mysql.js --sqlite /data-legacy/app.db --verify --verify-secrets
+   ```
+   (Si vous préférez le CLI Docker en SSH sur l'hôte : `docker exec -it iptv-backend node dist/scripts/migrate-sqlite-to-mysql.js --sqlite /data-legacy/app.db --verify --verify-secrets`.)
 
-```bash
-docker compose up -d jellyfin radarr sonarr prowlarr qbittorrent
-```
-Le backend reste indifférent à ces conteneurs (`depends_on` volontairement absent pour eux) — l'app IPTV continue de fonctionner même si l'un d'eux n'est pas encore configuré.
+   - Sortie attendue : compteurs de lignes qui matchent ceux notés à l'Étape 1, `verify-secrets: N/N decrypted OK`, `SUCCESS — transaction committed.`
+   - **Un exit code non nul = rien n'a été écrit** (rollback automatique côté script) → voir "Rollback" plus bas, ne rien casser en retentant à l'aveugle.
 
-## Étape 5 — Configuration manuelle (une fois, dans le navigateur)
+3. **Smoke test** (avant de considérer la bascule réussie) :
+   - `curl http://192.168.1.13:8081/api/system/health` → `{"mysql":true,"redis":true}`
+   - Se connecter avec `test@test.com` / `testtest`
+   - Vérifier que le compte IPTV existant est toujours là et que les catégories/contenus chargent
+   - Lancer un VOD déjà commencé avant la bascule → vérifie que la progression a survécu
+
+Les services média (Jellyfin/Radarr/Sonarr/Prowlarr/qBittorrent) sont déjà up à ce stade — `backend` ne dépend d'eux pour rien (`depends_on` volontairement absent), donc rien ci-dessus n'attend leur configuration.
+
+## Étape 4 — Configuration manuelle (une fois, dans le navigateur)
 
 Rien ci-dessous n'est scriptable — chaque outil a son propre assistant de première configuration.
 
 **1. qBittorrent — `http://192.168.1.13:8090`**
-- Mot de passe temporaire affiché dans les logs au premier démarrage (`docker compose logs qbittorrent | grep -i password`) — à changer immédiatement dans Tools > Options > Web UI.
+- Mot de passe temporaire affiché dans les logs au premier démarrage (Portainer → Containers → `iptv-qbittorrent` → Logs, chercher "password") — à changer immédiatement dans Tools > Options > Web UI.
 - Options → Downloads : *Default Save Path* = `/media/downloads/complete`, activer *Keep incomplete torrents in* = `/media/downloads/incomplete`.
 - Options → BitTorrent : limiter le nombre de connexions/vitesse si besoin.
 
 **2. Prowlarr — `http://192.168.1.13:9696`**
 - Indexers → Add Indexer → **C411** (Newznab/Torznab selon ce que C411 expose — renseigner l'URL + clé API/passkey de votre compte C411). Ajoutez aussi des indexeurs publics gratuits si vous en voulez d'autres.
-- Settings → Apps → **Add Radarr** (URL interne `http://radarr:7878`, clé API — récupérée à l'étape 3 ci-dessous) et **Add Sonarr** (`http://sonarr:8989`) → Prowlarr synchronise ensuite automatiquement les indexeurs vers les deux.
+- Settings → Apps → **Add Radarr** (URL interne `http://radarr:7878`, clé API — récupérée au point 3 ci-dessous) et **Add Sonarr** (`http://sonarr:8989`) → Prowlarr synchronise ensuite automatiquement les indexeurs vers les deux.
 
 **3. Radarr — `http://192.168.1.13:7878`**
 - Définir l'authentification admin (obligatoire depuis Radarr v5).
 - Settings → Media Management → Root Folders → ajouter `/media/movies`.
 - Settings → Profiles → noter l'**id** du profil de qualité voulu (visible dans l'URL en éditant le profil, ex. `/settings/profiles/edit/4` → `4`).
-- Settings → Download Clients → **Add qBittorrent** : host `qbittorrent`, port `8090`, identifiants définis à l'étape 1, catégorie `radarr`. Tester.
+- Settings → Download Clients → **Add qBittorrent** : host `qbittorrent`, port `8090`, identifiants définis au point 1, catégorie `radarr`. Tester.
 - Settings → General → copier la **clé API** → `RADARR_API_KEY`.
 - Settings → Connect → **Add Webhook** : URL `http://192.168.1.13:8081/api/webhooks/radarr/<REQUESTS_WEBHOOK_SECRET>`, méthode `POST`, déclencheurs : On Grab, On Import, On Movie Added, On Movie Delete, On Movie File Delete. Tester (200 attendu).
 - Revenir dans **Prowlarr** et finir la synchro Apps maintenant que la clé API existe.
@@ -143,24 +136,21 @@ Rien ci-dessous n'est scriptable — chaque outil a son propre assistant de prem
 - Assistant → compte admin → bibliothèque "Films" (`/media/movies`) + "Séries" (`/media/series`).
 - Dashboard → Advanced → API Keys → créer une clé `streamhub` → `JELLYFIN_API_KEY`.
 
-**6. Exporter les clés récupérées** (`JELLYFIN_API_KEY`, `RADARR_API_KEY`, `RADARR_QUALITY_PROFILE_ID`, `SONARR_API_KEY`, `SONARR_QUALITY_PROFILE_ID` — `RADARR_ROOT_FOLDER`/`SONARR_ROOT_FOLDER` ont déjà les bonnes valeurs par défaut dans `docker-compose.yml`) via le même mécanisme qu'à l'étape 2, puis :
+**6. Reporter les clés récupérées dans le panneau Environment variables de Portainer** (`JELLYFIN_API_KEY`, `RADARR_API_KEY`, `RADARR_QUALITY_PROFILE_ID`, `SONARR_API_KEY`, `SONARR_QUALITY_PROFILE_ID` — `RADARR_ROOT_FOLDER`/`SONARR_ROOT_FOLDER` ont déjà les bonnes valeurs par défaut dans `docker-compose.yml`), puis redéployer la stack (Portainer relit l'environnement au redémarrage du conteneur `backend`) :
 ```bash
-docker compose up -d backend   # relit l'environnement exporté
 curl http://192.168.1.13:8081/api/system/integrations
 # -> { "tmdb": ..., "jellyfin": true, "radarr": true, "sonarr": true }
 ```
 Si `tmdb` est `false`, la fonctionnalité "Demander un film/série" reste masquée tant que `TMDB_API_KEY` n'est pas ajoutée (pas obligatoire pour le reste de la stack).
 
-## Étape 6 — Réactiver Watchtower
+## Étape 5 — Réactiver Watchtower
 
-Une fois tout vérifié stable, réactiver Watchtower (ou le laisser en pause si vous préférez continuer à déployer manuellement — c'est plus sûr pour ce genre de changement).
+Une fois tout vérifié stable, réactiver Watchtower (ou le laisser en pause si vous préférez continuer à déployer manuellement via Portainer — c'est plus sûr pour ce genre de changement).
 
-## Rollback (si l'étape 3 échoue ou si un problème apparaît après)
+## Rollback
 
-Le volume `backend_data` (SQLite) n'est **jamais touché** par le nouveau code (monté en lecture seule) — le rollback restaure l'état exact d'avant la bascule, sans perte :
-```bash
-docker compose stop backend frontend
-# Revenir à l'image d'avant (digest noté à l'étape 1)
-docker compose -f docker-compose.yml -f docker-compose.rollback.yml up -d backend frontend
-```
-Garder `backend_data` et le digest noté pendant au moins une semaine après une bascule réussie avant de nettoyer quoi que ce soit.
+**Option la plus simple : restaurer le snapshot machine** pris avant la bascule (voir Étape 1) — revient sur toute la VM à l'état d'avant, `backend_data` (SQLite) y compris puisqu'il n'a jamais été modifié par le nouveau code.
+
+**Option plus ciblée, si vous préférez ne pas toucher au reste de la VM** : dans Portainer, redéployez la stack avec l'ancienne version de `docker-compose.yml` (celle d'avant cette bascule — Portainer garde généralement un historique des éditions de stack, sinon gardez une copie de l'ancien fichier de côté avant de le remplacer). Le volume `backend_data` n'est jamais touché par le nouveau code (monté en lecture seule), donc revenir à l'ancienne stack retrouve l'état exact d'avant, sans perte.
+
+Garder le snapshot et `backend_data` intacts pendant au moins une semaine après une bascule réussie avant de nettoyer quoi que ce soit.
