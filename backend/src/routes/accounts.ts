@@ -51,8 +51,16 @@ export function registerAccountRoutes(app: FastifyInstance) {
     // the first time this is called — no-op when JELLYFIN_URL/API_KEY are unset.
     await ensureJellyfinSource(request.user.userId);
 
+    // Oldest first, on purpose: the frontend defaults to `items[0]` whenever
+    // it needs to pick an account (first login, or the previously-active
+    // one no longer exists) — with newest-first, an auto-provisioned source
+    // like Jellyfin (always created after a user's real accounts already
+    // exist) would silently become the default and hijack browsing the
+    // moment `accountId` gets reset for any reason. Oldest-first keeps the
+    // user's actual first account as the default no matter how many
+    // auto-provisioned sources get added later.
     const rows = await queryAll(
-      'SELECT id, name, server_url, username, kind, created_at FROM media_sources WHERE user_id = ? ORDER BY id DESC',
+      'SELECT id, name, server_url, username, kind, created_at FROM media_sources WHERE user_id = ? ORDER BY id ASC',
       [request.user.userId]
     );
     return { items: rows };
