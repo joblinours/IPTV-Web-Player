@@ -143,21 +143,29 @@ async function main() {
 
     const progressRows = sqlite
       .prepare(
+        // "current_time" MUST be quoted: unquoted, SQLite parses it as the
+        // special CURRENT_TIME literal (today's wall-clock time as a
+        // string, e.g. "13:42:38") instead of a reference to the column of
+        // that name — silently aliasing the wrong value to position_seconds.
         `SELECT id, user_id, account_id, type, item_id, series_id, season_number, episode_number,
-                current_time AS position_seconds, total_duration, is_watched, needs_transcode, updated_at
+                "current_time" AS position_seconds, total_duration, is_watched, needs_transcode, updated_at
          FROM watch_progress`
       )
       .all() as any[];
     let clampedCount = 0;
     for (const row of progressRows) {
-      let position = row.position_seconds;
-      let total = row.total_duration;
+      // Coerce first: defends against any other non-numeric surprise from
+      // the legacy DB the same way, instead of letting a bad type silently
+      // turn into NaN through Math.max/Math.min (which propagate NaN rather
+      // than picking a safe bound when one operand isn't a finite number).
+      let position = Number(row.position_seconds);
+      let total = Number(row.total_duration);
       if (!Number.isFinite(position) || position < 0 || position > 1e9) {
-        position = Math.min(Math.max(position || 0, 0), 1e9);
+        position = Math.min(Math.max(Number.isFinite(position) ? position : 0, 0), 1e9);
         clampedCount++;
       }
       if (!Number.isFinite(total) || total < 0 || total > 1e9) {
-        total = Math.min(Math.max(total || 0, 0), 1e9);
+        total = Math.min(Math.max(Number.isFinite(total) ? total : 0, 0), 1e9);
         clampedCount++;
       }
 
