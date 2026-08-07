@@ -262,7 +262,10 @@ export async function fetchStreamUrl(
   params: {
     accountId: number;
     section: SectionType;
-    streamId: number;
+    // A string works for both an Xtream numeric streamId and a Jellyfin
+    // GUID — the backend accepts either under `itemId` (see idFields in
+    // backend/src/routes/stream.ts).
+    itemId: string;
     containerExtension?: string;
     debugContext?: PlaybackDebugContext;
   }
@@ -271,7 +274,7 @@ export async function fetchStreamUrl(
   const query = new URLSearchParams({
     accountId: String(params.accountId),
     type,
-    streamId: String(params.streamId),
+    itemId: params.itemId,
     containerExtension: params.containerExtension ?? 'm3u8',
   });
 
@@ -326,7 +329,7 @@ export function buildTranscodeUrl(params: {
   token: string;
   accountId: number;
   section: SectionType;
-  streamId: number;
+  itemId: string;
   containerExtension?: string;
   durationSeconds?: number;
   debugContext?: PlaybackDebugContext;
@@ -336,7 +339,7 @@ export function buildTranscodeUrl(params: {
     token: params.token,
     accountId: String(params.accountId),
     type,
-    streamId: String(params.streamId),
+    itemId: params.itemId,
     containerExtension: params.containerExtension ?? 'mkv',
   });
 
@@ -353,7 +356,7 @@ export function buildStreamProxyUrl(params: {
   token: string;
   accountId: number;
   section: SectionType;
-  streamId: number;
+  itemId: string;
   containerExtension?: string;
   debugContext?: PlaybackDebugContext;
 }) {
@@ -362,7 +365,7 @@ export function buildStreamProxyUrl(params: {
     token: params.token,
     accountId: String(params.accountId),
     type,
-    streamId: String(params.streamId),
+    itemId: params.itemId,
     containerExtension: params.containerExtension ?? (type === 'live' ? 'm3u8' : 'mp4'),
   });
 

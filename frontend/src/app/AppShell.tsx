@@ -610,7 +610,10 @@ export default function AppShell() {
         async (
             item: ContentItem,
             section: SectionType,
-            streamId: number,
+            // A string identifier, not a numeric Xtream streamId: works for
+            // both an Xtream stream (stringified number) and a Jellyfin item
+            // (GUID) — see backend/src/routes/stream.ts's idFields.
+            externalId: string,
             debugContext?: PlaybackDebugContext
         ) => {
             if (!token || !accountId) return [];
@@ -628,19 +631,19 @@ export default function AppShell() {
                         if (section === 'live') {
                             const mustProxy = window.location.protocol === 'https:';
                             if (mustProxy) {
-                                return buildStreamProxyUrl({ token, accountId, section, streamId, containerExtension: extension, debugContext });
+                                return buildStreamProxyUrl({ token, accountId, section, itemId: externalId, containerExtension: extension, debugContext });
                             }
 
-                            const response = await fetchStreamUrl(token, { accountId, section, streamId, containerExtension: extension, debugContext });
+                            const response = await fetchStreamUrl(token, { accountId, section, itemId: externalId, containerExtension: extension, debugContext });
 
                             if (/^http:\/\//i.test(response.url)) {
-                                return buildStreamProxyUrl({ token, accountId, section, streamId, containerExtension: extension, debugContext });
+                                return buildStreamProxyUrl({ token, accountId, section, itemId: externalId, containerExtension: extension, debugContext });
                             }
 
                             return response.url;
                         }
 
-                        return buildStreamProxyUrl({ token, accountId, section, streamId, containerExtension: extension, debugContext });
+                        return buildStreamProxyUrl({ token, accountId, section, itemId: externalId, containerExtension: extension, debugContext });
                     } catch {
                         return null;
                     }
@@ -649,7 +652,7 @@ export default function AppShell() {
 
             if (section === 'films' || section === 'series') {
                 const transcodeUrl = buildTranscodeUrl({
-                    token, accountId, section, streamId,
+                    token, accountId, section, itemId: externalId,
                     containerExtension: normalizedContainer || 'mp4',
                     durationSeconds: item.durationSeconds,
                     debugContext,
@@ -665,7 +668,7 @@ export default function AppShell() {
             if (section === 'live') {
                 urls.push(
                     buildTranscodeUrl({
-                        token, accountId, section, streamId,
+                        token, accountId, section, itemId: externalId,
                         containerExtension: normalizedContainer || 'ts',
                         durationSeconds: item.durationSeconds,
                         debugContext,
@@ -811,7 +814,7 @@ export default function AppShell() {
                 id: String(next.id), title: next.title, categoryId: '', poster: next.poster, description: null, genre: null, year: null,
                 rating: next.rating ? String(next.rating) : null, containerExtension: next.containerExtension, streamId: null, seriesId: next.id,
             },
-            'series', next.id,
+            'series', String(next.id),
             { mediaTitle: next.title, seriesTitle: seriesData.info.name, seasonNumber: next.seasonNumber, episodeNumber: next.episodeNumber }
         );
 
@@ -844,7 +847,7 @@ export default function AppShell() {
                 id: String(previous.id), title: previous.title, categoryId: '', poster: previous.poster, description: null, genre: null, year: null,
                 rating: previous.rating ? String(previous.rating) : null, containerExtension: previous.containerExtension, streamId: null, seriesId: previous.id,
             },
-            'series', previous.id,
+            'series', String(previous.id),
             { mediaTitle: previous.title, seriesTitle: seriesData.info.name, seasonNumber: previous.seasonNumber, episodeNumber: previous.episodeNumber }
         );
 
@@ -970,7 +973,7 @@ export default function AppShell() {
                             id: String(targetEpisode.id), title: targetEpisode.title, categoryId: '', poster: targetEpisode.poster, description: null, genre: null, year: null,
                             rating: targetEpisode.rating ? String(targetEpisode.rating) : null, containerExtension: targetEpisode.containerExtension, streamId: null, seriesId: targetEpisode.id,
                         },
-                        'series', targetEpisode.id,
+                        'series', String(targetEpisode.id),
                         { mediaTitle: targetEpisode.title, seriesTitle: seriesData.info.name, seasonNumber: targetEpisode.seasonNumber, episodeNumber: targetEpisode.episodeNumber }
                     );
 
@@ -986,12 +989,16 @@ export default function AppShell() {
                     return;
                 }
 
-                const streamId = item.streamId;
-                if (!streamId) return;
+                // Xtream items carry a numeric streamId; Jellyfin items only
+                // have itemId (a GUID) — streamId stays null for those (see
+                // backend/src/sources/jellyfin.ts's mapItem). Prefer itemId
+                // when present so both sources actually play.
+                const externalId = item.itemId ?? (item.streamId ? String(item.streamId) : null);
+                if (!externalId) return;
 
                 const vodProg = vodProgressMap[`${accountId}:${item.id}`];
                 const vodStartTimeSec = vodProg && !vodProg.isWatched && vodProg.currentTime > 0 ? vodProg.currentTime : undefined;
-                const rawVodSources = await resolvePlaybackSources(item, activeSection, streamId, { mediaTitle: item.title });
+                const rawVodSources = await resolvePlaybackSources(item, activeSection, externalId, { mediaTitle: item.title });
                 const vodSources = vodProg?.needsTranscode ? addSeekToTranscodeSources(reorderWithTranscodeFirst(rawVodSources), vodStartTimeSec) : rawVodSources;
                 currentlyPlayingRef.current = activeSection === 'live' ? null : { type: 'vod', itemId: item.id, accountId };
                 setCurrentSeriesPlayContext(null);
@@ -1020,7 +1027,7 @@ export default function AppShell() {
                         id: String(episode.id), title: episode.title, categoryId: '', poster: episode.poster, description: null, genre: null, year: null,
                         rating: episode.rating ? String(episode.rating) : null, containerExtension: episode.containerExtension, streamId: null, seriesId: episode.id,
                     },
-                    'series', episode.id,
+                    'series', String(episode.id),
                     { mediaTitle: episode.title, seriesTitle: seriesDetailData?.info.name ?? undefined, seasonNumber: episode.seasonNumber, episodeNumber: episode.episodeNumber }
                 );
 
