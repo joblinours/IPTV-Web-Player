@@ -273,7 +273,20 @@ volumes:
   # backend_data/mysql_data/redis_data/*_config stay as regular Docker-managed
   # volumes (default Docker storage location) — only large media files live
   # on the ZFS mirror, via the bind mount below, not these.
-  backend_data: {} # legacy SQLite — DO NOT REMOVE during/shortly after the MySQL cutover
+  #
+  # backend_data is `external: true`, pinned by exact name, on purpose: a
+  # plain `backend_data: {}` gets silently prefixed with *this* stack's
+  # project name by Compose/Portainer, which creates a brand-new EMPTY
+  # volume instead of reusing the one from the old (pre-MySQL) deployment —
+  # exactly what happened on first deploy here (SQLITE_CANTOPEN, because
+  # `docker-compose.yml`'s own `backend_data` volume was empty). Pointing at
+  # the real, existing volume by name sidesteps that regardless of what this
+  # stack ends up being named in Portainer. Override via LEGACY_BACKEND_DATA_VOLUME
+  # if migrating from a different volume. DO NOT REMOVE this volume until
+  # confident the MySQL migration is good.
+  backend_data:
+    external: true
+    name: ${LEGACY_BACKEND_DATA_VOLUME:-iptv-player-dev_backend_data_dev}
   mysql_data: {}
   redis_data: {}
   jellyfin_config: {}
